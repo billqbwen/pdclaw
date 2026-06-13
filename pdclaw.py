@@ -670,12 +670,15 @@ def save_state(state_dir: Path, issue_number: int, state: dict) -> None:
 # ── Path / slug utilities ────────────────────────────────────────────────────
 
 
-def slugify(text: str, max_len: int = 80) -> str:
-    """Convert text to a filesystem-safe slug."""
+def slugify(text: str, max_len: int = 50) -> str:
+    """Convert text to a filesystem-safe slug, truncated to max_len."""
     s = text.lower().strip()
     s = re.sub(r"[^\w\s-]", "", s)
     s = re.sub(r"[-\s]+", "-", s).strip("-")
-    return s[:max_len]
+    # Truncate to max_len, but avoid cutting in the middle of a word
+    if len(s) > max_len:
+        s = s[:max_len].rstrip("-")
+    return s
 
 
 def step_output_dir(base: Path, issue_number: int, title: str, step: str) -> Path:
