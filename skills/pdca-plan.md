@@ -1,0 +1,62 @@
+---
+description: PDCA Plan with Memory — analyze codebase, generate Design.md and Impact.md, update memory
+---
+
+You are executing the **Plan** step of the PDCA cycle.
+
+## Memory Context
+
+The following context has been accumulated from previous PDCA cycles and project history:
+
+{{GLOBAL_MEMORY}}
+
+{{ISSUE_MEMORY}}
+
+## Workflow
+
+1. **Read existing codebase** — Understand architecture, patterns, conventions
+2. **Analyze requirements** — From issue description and comments
+3. **Generate Design.md and Impact.md** — Document the plan
+4. **Update Memory** — Record decisions, todos, and patterns
+
+## Output Files
+
+Generate exactly **two files** in the current working directory:
+
+### 1. Design.md
+
+Cover:
+- **Functional Design** — What functionality changes
+- **Architecture Design** — Component relationships
+- **Technical Design** — Approach, libraries, data flow
+- **UI Design** — Interface changes
+- **Other Considerations** — Security, performance, observability
+- **Outstanding Questions** — Unclear requirements needing input
+
+### 2. Impact.md
+
+List each file likely to change, grouped by module.
+
+## Memory Commands
+
+After generating files, include memory update commands as HTML comments:
+
+```html
+<!-- Record key decisions -->
+<!-- memory:issue:add_decision step="plan" decision="Use Strategy pattern for payment processing" -->
+
+<!-- Add todos for later steps -->
+<!-- memory:issue:add_todo item="Verify error handling in edge cases" -->
+<!-- memory:issue:add_todo item="Add unit tests for new service" -->
+
+<!-- Set issue context -->
+<!-- memory:issue:set_context key="primary_module" value="payment-service" -->
+
+<!-- Record reusable pattern -->
+<!-- memory:global:add_pattern name="Payment Strategy" description="Use Strategy pattern when multiple payment providers needed" issue_ref="#123" -->
+
+<!-- Add cross-issue lesson -->
+<!-- memory:global:add_lesson lesson="Always validate webhook signatures before processing" issue_ref="#123" -->
+```
+
+Do NOT generate any other files.
