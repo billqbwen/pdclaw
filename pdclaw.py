@@ -2049,7 +2049,7 @@ def main() -> None:
         _dashboard = start_dashboard(
             host="0.0.0.0",
             port=args.dashboard_port,
-            get_snapshot=lambda: _metrics_collector.snapshot(),
+            get_snapshot=_metrics_collector.snapshot,
         )
 
     # 确定是否使用会话模式

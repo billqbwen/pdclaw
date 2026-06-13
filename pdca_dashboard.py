@@ -200,7 +200,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
     """Minimal HTTP handler serving dashboard and API endpoints."""
 
     # Class-level references set by the server factory
-    get_snapshot: Callable[[], dict] = lambda: {}
+    get_snapshot: Callable[[], dict] = staticmethod(lambda: {})
     log_lines: list[str] = []
     max_log_lines: int = 200
 
@@ -278,7 +278,7 @@ class DashboardServer:
         self._running = False
 
         # Wire up the snapshot callback
-        DashboardHandler.get_snapshot = get_snapshot or (lambda: {})
+        DashboardHandler.get_snapshot = staticmethod(get_snapshot) if get_snapshot else staticmethod(lambda: {})
 
     def start(self) -> None:
         if self._running:
