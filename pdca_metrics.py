@@ -215,6 +215,27 @@ class MetricsCollector:
                 "rate_limits": self.rate_limits[-5:],
             }
 
+    def issue_detail(self, issue_number: int) -> dict[str, Any] | None:
+        """Return detailed info for a single issue."""
+        with self._lock:
+            iss = self.issues.get(issue_number)
+            if not iss:
+                return None
+            issue_calls = [
+                c.to_dict() for c in self.ai_calls
+                if c.issue_number == issue_number
+            ]
+            return {
+                "number": iss.issue_number,
+                "title": iss.title,
+                "created": iss.created_at,
+                "completed": iss.completed_at or None,
+                "calls": iss.total_ai_calls,
+                "total_sec": round(iss.total_ai_sec, 1),
+                "transitions": iss.transitions,
+                "ai_calls": issue_calls,
+            }
+
     # ── Persistence ───────────────────────────────────────────────────────
 
     def _append_jsonl(self, filename: str, record: dict) -> None:

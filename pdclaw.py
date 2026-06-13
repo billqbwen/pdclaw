@@ -2050,6 +2050,7 @@ def main() -> None:
             host="0.0.0.0",
             port=args.dashboard_port,
             get_snapshot=_metrics_collector.snapshot,
+            get_issue_detail=_metrics_collector.issue_detail,
         )
 
     # 确定是否使用会话模式
