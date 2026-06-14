@@ -93,6 +93,7 @@ const $ = (s) => document.querySelector(s);
 const $$ = (s) => document.querySelectorAll(s);
 
 function fmtSec(s) {
+  s = Math.ceil(s);
   if (s < 60) return s + 's';
   const m = Math.floor(s / 60);
   const sec = s % 60;
@@ -284,6 +285,7 @@ const STEP_COLORS = {plan:'var(--blue)', do:'var(--purple)', check:'var(--yellow
 function esc(s) { const d=document.createElement('div'); d.textContent=s||''; return d.innerHTML; }
 function fmtSec(s) {
   if (!s) return '0s';
+  s = Math.ceil(s);
   if (s<60) return s+'s';
   return Math.floor(s/60)+'m '+(s%60)+'s';
 }

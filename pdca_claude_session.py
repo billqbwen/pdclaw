@@ -220,17 +220,56 @@ def get_session(issue_number: int, work_dir: Path,
     return _sessions[issue_number]
 
 
-def reset_session(issue_number: int):
-    """重置指定 issue 的会话"""
-    if issue_number in _sessions:
-        _sessions[issue_number].reset()
+def reset_session(issue_number: int, work_dir: Path | None = None):
+    """重置指定 issue 的会话
+
+    Args:
+        issue_number: Issue 编号
+        work_dir: 工作目录，用于定位 session 文件。如果不提供，会尝试从
+                  已缓存的 session 中获取 work_dir，最后回退到相对路径。
+    """
+    # 先从缓存中获取 session 以确定正确的 work_dir
+    cached = _sessions.get(issue_number)
+    if cached:
+        cached.reset()
         del _sessions[issue_number]
-    else:
-        # 即使没有缓存，也清理文件
-        session_file = Path(".pdca_state") / str(issue_number) / "claude_session.json"
+
+    # 清理磁盘上的 session 文件
+    # session 文件可能存储在不同的位置（取决于 step 的 skill_cwd）：
+    # - Plan/Check/Act: step_dir/.pdca_state/{n}/claude_session.json
+    # - Do: base_work_dir/.pdca_state/{n}/claude_session.json
+    # 因此需要尝试多个可能的路径
+    candidates: list[Path] = []
+
+    if work_dir:
+        candidates.append(work_dir / ".pdca_state" / str(issue_number) / "claude_session.json")
+        # 同时尝试 work_dir 下递归搜索（处理 step_dir 已变化的情况）
+        try:
+            for found in work_dir.rglob(f".pdca_state/{issue_number}/claude_session.json"):
+                if found not in candidates:
+                    candidates.append(found)
+        except Exception:
+            pass
+
+    if cached:
+        sf = cached.session_file
+        if sf not in candidates:
+            candidates.append(sf)
+
+    # 回退路径
+    fallback = Path(".pdca_state") / str(issue_number) / "claude_session.json"
+    if fallback not in candidates:
+        candidates.append(fallback)
+
+    deleted = 0
+    for session_file in candidates:
         if session_file.exists():
             session_file.unlink()
-            log.info(f"Cleaned up session file for issue #{issue_number}")
+            log.info(f"Cleaned up session file for issue #{issue_number} at {session_file}")
+            deleted += 1
+
+    if deleted == 0:
+        log.debug(f"No session file found for issue #{issue_number} (checked {len(candidates)} paths)")
 
 
 def clear_all_sessions():

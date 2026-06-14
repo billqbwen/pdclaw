@@ -294,6 +294,11 @@ def resolve_next_step(tags: set[str], completed_steps: list[str]) -> str | None:
 
     Each -approved tag also implies the step itself should run if it hasn't yet.
     Sequential ordering is enforced: a step only runs if all predecessors are done.
+
+    NOTE: #check-approved is intercepted by the check-review phase handler
+    (in process_issue) before this function is reached.  If this function IS
+    reached with #check-approved (e.g. backward-compat or edge case), it
+    resolves to "act" only when all predecessors are completed.
     """
     confirmed_order: list[str] = []
 
@@ -309,6 +314,9 @@ def resolve_next_step(tags: set[str], completed_steps: list[str]) -> str | None:
     if "#do-approved" in tags:
         confirmed_order.append("check")
 
+    # #check-approved advances to act, BUT the check-review phase handler
+    # (in process_issue) will intercept this tag first and transition to
+    # the decision phase rather than jumping straight to the act step.
     if "#check-approved" in tags:
         confirmed_order.append("act")
 
@@ -658,6 +666,7 @@ def load_state(state_dir: Path, issue_number: int) -> dict:
         "last_check": None,
         "last_issue_body": None,
         "last_issue_labels": [],
+        "step_completed_at": None,
     }
 
 
@@ -813,8 +822,8 @@ def run_skill(
 
     # 如果强制新会话，重置会话
     if new_session and use_session:
-        reset_session(issue_number)
-        log.info("[AI] Session reset for issue #%d (new_session=True)", issue_number)
+        reset_session(issue_number, work_dir)
+        log.info("[AI] Session reset for issue #%d (new_session=True, work_dir=%s)", issue_number, work_dir)
 
     skill_content = _read_skill(skill_name)
 
@@ -1035,6 +1044,52 @@ def _find_changed_files(repo_root: Path) -> list[str]:
     return files
 
 
+def _verify_push_landed(repo_root: Path) -> bool:
+    """After a push, fetch and compare local vs remote HEAD to confirm
+    the commit actually reached the remote.  Returns True if verified,
+    False if the remote is behind (push silently failed)."""
+    try:
+        branch_result = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=str(repo_root), capture_output=True, text=True, timeout=10,
+        )
+        current_branch = branch_result.stdout.strip() if branch_result.returncode == 0 else ""
+
+        if not current_branch:
+            log.warning("Push verification: cannot determine current branch — skipping check")
+            return True  # can't verify but don't block
+
+        subprocess.run(
+            ["git", "fetch", "origin", current_branch],
+            cwd=str(repo_root), capture_output=True, timeout=60,
+            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+        )
+        local_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(repo_root), capture_output=True, text=True, timeout=10,
+        ).stdout.strip()
+        remote_sha = subprocess.run(
+            ["git", "rev-parse", f"origin/{current_branch}"],
+            cwd=str(repo_root), capture_output=True, text=True, timeout=10,
+        ).stdout.strip()
+
+        if local_sha and remote_sha and local_sha == remote_sha:
+            log.info("Push verified — local and remote HEAD match (%s)", local_sha[:10])
+            return True
+        else:
+            log.warning(
+                "Push verification FAILED — local HEAD %s != origin/%s %s. "
+                "Push may not have reached the remote.",
+                local_sha[:10] if local_sha else "?",
+                current_branch,
+                remote_sha[:10] if remote_sha else "?",
+            )
+            return False
+    except Exception as exc:
+        log.warning("Push verification error (non-fatal): %s", exc)
+        return True  # can't verify but don't block
+
+
 def git_commit_and_push(files: list[Path], message: str, repo_root: Path) -> bool:
     """Stage, commit, and push generated files. Returns True on full success."""
     # Stage the step output files
@@ -1056,7 +1111,9 @@ def git_commit_and_push(files: list[Path], message: str, repo_root: Path) -> boo
         cwd=str(repo_root), capture_output=True,
     )
     if diff_result.returncode == 0:
-        log.info("Nothing new to commit (no staged changes)")
+        log.warning("Nothing new to commit — files may not have changed (no staged changes)")
+        # Return True so the runner doesn't treat this as a failure, but
+        # the caller can distinguish "nothing changed" from "push OK" if needed.
         return True
 
     # Commit (disable GPG signing to avoid blocking for passphrase)
@@ -1072,47 +1129,65 @@ def git_commit_and_push(files: list[Path], message: str, repo_root: Path) -> boo
         log.error("git commit failed: %s", stderr[:200])
         return False
 
-    # Push
-    try:
-        subprocess.run(
-            ["git", "push"],
-            cwd=str(repo_root),
-            check=True,
-            capture_output=True,
-            timeout=120,
-            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
-            stdin=subprocess.DEVNULL,
-        )
-        log.info("Git push successful")
-    except subprocess.TimeoutExpired:
-        log.warning("git push timed out after 120s — files committed locally but not pushed")
-        return False
-    except subprocess.CalledProcessError as e:
-        stderr = e.stderr.decode() if isinstance(e.stderr, bytes) else str(e.stderr or "")
-        # New branch needs upstream set
-        if "no upstream" in stderr or "no such branch" in stderr:
-            try:
-                subprocess.run(
-                    ["git", "push", "-u", "origin", "HEAD"],
-                    cwd=str(repo_root),
-                    check=True,
-                    capture_output=True,
-                    timeout=120,
-                    env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
-                    stdin=subprocess.DEVNULL,
-                )
-                log.info("Git push successful (new branch)")
-            except subprocess.TimeoutExpired:
-                log.warning("git push timed out after 120s")
-                return False
-            except subprocess.CalledProcessError as e2:
-                s2 = e2.stderr.decode() if isinstance(e2.stderr, bytes) else str(e2.stderr or "")
-                log.warning("git push failed (non-fatal): %s", s2[:200])
-                return False
-        else:
-            log.warning("git push failed (non-fatal): %s", stderr[:200])
-            return False
+    # Push — with retry for transient network failures
+    max_retries = 3
+    push_succeeded = False
+    for attempt in range(1, max_retries + 1):
+        try:
+            subprocess.run(
+                ["git", "push"],
+                cwd=str(repo_root),
+                check=True,
+                capture_output=True,
+                timeout=120,
+                env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+                stdin=subprocess.DEVNULL,
+            )
+            push_succeeded = True
+            break
+        except subprocess.TimeoutExpired:
+            log.warning("git push timed out after 120s (attempt %d/%d)", attempt, max_retries)
+        except subprocess.CalledProcessError as e:
+            stderr = e.stderr.decode() if isinstance(e.stderr, bytes) else str(e.stderr or "")
+            # New branch needs upstream set
+            if "no upstream" in stderr or "no such branch" in stderr:
+                try:
+                    subprocess.run(
+                        ["git", "push", "-u", "origin", "HEAD"],
+                        cwd=str(repo_root),
+                        check=True,
+                        capture_output=True,
+                        timeout=120,
+                        env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+                        stdin=subprocess.DEVNULL,
+                    )
+                    push_succeeded = True
+                    break
+                except subprocess.TimeoutExpired:
+                    log.warning("git push -u timed out after 120s (attempt %d/%d)", attempt, max_retries)
+                except subprocess.CalledProcessError as e2:
+                    s2 = e2.stderr.decode() if isinstance(e2.stderr, bytes) else str(e2.stderr or "")
+                    log.warning("git push -u failed (attempt %d/%d): %s", attempt, max_retries, s2[:200])
+            else:
+                log.warning("git push failed (attempt %d/%d): %s", attempt, max_retries, stderr[:200])
 
+        if attempt < max_retries:
+            delay = attempt * 10
+            log.info("Retrying git push in %ds...", delay)
+            time.sleep(delay)
+
+    if not push_succeeded:
+        log.warning("git push failed after %d attempts — files committed locally but not pushed", max_retries)
+        return False
+
+    # Post-push verification: fetch and compare local vs remote HEAD to
+    # ensure the push actually landed on the remote.  This catches edge
+    # cases where `git push` exits 0 but the commit never reaches the
+    # remote (e.g. pre-receive hook rejection, network truncation).
+    if not _verify_push_landed(repo_root):
+        return False
+
+    log.info("Git push successful")
     return True
 
 
@@ -1187,7 +1262,7 @@ def _handle_lifecycle_tags(
                 log.info("Issue #%d: memory cleared via #pdca-reset", number)
 
         # Clear Claude session for this issue
-        reset_session(number)
+        reset_session(number, base_work_dir)
         log.info("Issue #%d: Claude session cleared via #pdca-reset", number)
 
         # Reset state in-place and save — do NOT delete the state file
@@ -1208,7 +1283,7 @@ def _handle_lifecycle_tags(
 
     if "#pdca-new-session" in tags:
         # 仅重置 Claude 会话，不清除状态和记忆
-        reset_session(number)
+        reset_session(number, base_work_dir)
         state["new_session"] = True  # 标记下次执行使用新会话
         save_state(state_dir, number, state)
         _gh.add_comment(
@@ -1321,7 +1396,7 @@ def _handle_decision_tag(
         state["current_step"] = None
         state["phase"] = None
         state["last_check"] = datetime.now(timezone.utc).isoformat()
-        reset_session(number)
+        reset_session(number, base_work_dir)
         save_state(state_dir, number, state)
         _gh.add_comment(
             owner, repo, number,
@@ -1400,10 +1475,44 @@ def ensure_pdca_branch(
             cwd=str(repo_root), capture_output=True, text=True,
         )
         if result.returncode == 0:
-            subprocess.run(
+            # Stash any dirty changes before checkout to avoid "Please commit
+            # your changes or stash them" errors that get swallowed by
+            # capture_output.  The stash is popped after checkout.
+            _stashed = False
+            try:
+                status = subprocess.run(
+                    ["git", "status", "--porcelain"],
+                    cwd=str(repo_root), capture_output=True, text=True, timeout=10,
+                )
+                if status.stdout.strip():
+                    subprocess.run(
+                        ["git", "stash", "push", "--include-untracked",
+                         "-m", f"pdca-auto-stash-{branch}"],
+                        cwd=str(repo_root), capture_output=True, timeout=30,
+                    )
+                    _stashed = True
+                    log.info("Stashed dirty changes before checkout of %s", branch)
+            except Exception:
+                pass
+
+            checkout = subprocess.run(
                 ["git", "checkout", branch],
-                cwd=str(repo_root), check=True, capture_output=True,
+                cwd=str(repo_root), capture_output=True, text=True,
             )
+            if checkout.returncode != 0:
+                stderr = checkout.stderr.strip()
+                log.error("Failed to checkout branch %s: %s", branch, stderr[:200])
+                return None
+
+            if _stashed:
+                try:
+                    subprocess.run(
+                        ["git", "stash", "pop"],
+                        cwd=str(repo_root), capture_output=True, timeout=30,
+                    )
+                except Exception:
+                    pass
+
             log.info("Reusing existing branch: %s", branch)
             return branch
 
@@ -1493,7 +1602,69 @@ def process_issue(
     is_new_issue = state.get("status") is None and not state.get("completed_steps")
     if is_new_issue:
         log.info("Issue #%d: new issue detected, ensuring fresh session", number)
-        reset_session(number)
+        reset_session(number, base_work_dir)
+
+    # Retry pending push from a previous cycle (e.g. transient network failure)
+    if state.get("push_pending"):
+        log.info("Issue #%d: retrying pending git push", number)
+        pdca_branch = state.get("pdca_branch") or f"pdca/{number}-{slugify(issue.get('title', ''))}"
+        push_retry_ok = False
+        for attempt in range(1, 4):
+            try:
+                subprocess.run(
+                    ["git", "push"],
+                    cwd=str(base_work_dir),
+                    check=True,
+                    capture_output=True,
+                    timeout=120,
+                    env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+                    stdin=subprocess.DEVNULL,
+                )
+                push_retry_ok = True
+                break
+            except subprocess.CalledProcessError as e:
+                stderr = e.stderr.decode() if isinstance(e.stderr, bytes) else str(e.stderr or "")
+                if "no upstream" in stderr or "no such branch" in stderr:
+                    try:
+                        subprocess.run(
+                            ["git", "push", "-u", "origin", "HEAD"],
+                            cwd=str(base_work_dir),
+                            check=True,
+                            capture_output=True,
+                            timeout=120,
+                            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+                            stdin=subprocess.DEVNULL,
+                        )
+                        push_retry_ok = True
+                        break
+                    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e2:
+                        s2 = e2.stderr.decode() if isinstance(e2, subprocess.CalledProcessError) and isinstance(e2.stderr, bytes) else str(e2)
+                        log.warning("Issue #%d: pending push -u failed (attempt %d/3): %s", number, attempt, s2[:200] if isinstance(s2, str) else "")
+                else:
+                    log.warning("Issue #%d: pending push failed (attempt %d/3): %s", number, attempt, stderr[:200])
+            except subprocess.TimeoutExpired:
+                log.warning("Issue #%d: pending push timed out (attempt %d/3)", number, attempt)
+
+            if attempt < 3:
+                delay = attempt * 10
+                log.info("Retrying pending push in %ds...", delay)
+                time.sleep(delay)
+
+        if push_retry_ok:
+            # Verify the push actually landed on the remote
+            if not _verify_push_landed(base_work_dir):
+                push_retry_ok = False
+                log.warning("Issue #%d: pending push verification failed — will retry next cycle", number)
+
+        if push_retry_ok:
+            log.info("Issue #%d: pending push succeeded", number)
+            state.pop("push_pending", None)
+            save_state(state_dir, number, state)
+        else:
+            # Still failing — wait for next cycle to retry
+            state["last_check"] = datetime.now(timezone.utc).isoformat()
+            save_state(state_dir, number, state)
+            return
 
     # Re-opened issue: GitHub is open but PDCA state says closed → resume
     if issue["state"] == "open" and state.get("status") in ("closed", "aborted", "skipped"):
@@ -1564,20 +1735,24 @@ def process_issue(
                 # the main flow; no need to force refresh.
                 log.info("[Refresh] #pdca-refresh found in tags but approval tag will advance to '%s' (no force needed)", approval_next)
             else:
-                # No approval can advance.  Check whether current_step
-                # is actually waiting for #pdca-refresh (i.e. the step
-                # was just executed and the user hasn't added any new
-                # #pdca-refresh since).  If last_check is newer than all
-                # #pdca-refresh comments, the tag is stale.
+                # No approval can advance.  Check whether the
+                # #pdca-refresh comments are genuinely stale — i.e. they
+                # were all posted before the current step was last
+                # completed.  Use step_completed_at (when the AI
+                # actually finished generating files) rather than
+                # last_check (which is bumped on every poll) so that
+                # refresh comments posted between step completion and
+                # the next poll are not incorrectly marked stale.
                 all_refresh_ts = []
                 for c in comments:
                     if "#pdca-refresh" in get_tags(c.get("body", "")):
                         ts = _parse_ts(c.get("created_at", ""))
                         if ts:
                             all_refresh_ts.append(ts)
-                last_check_ts = _parse_ts(state["last_check"]) if state.get("last_check") else None
-                if all_refresh_ts and last_check_ts and max(all_refresh_ts) < last_check_ts:
-                    log.info("[Refresh] #pdca-refresh comments are all older than last_check — stale, not forcing")
+                step_done_at = state.get("step_completed_at")
+                step_done_ts = _parse_ts(step_done_at) if step_done_at else None
+                if all_refresh_ts and step_done_ts and max(all_refresh_ts) < step_done_ts:
+                    log.info("[Refresh] #pdca-refresh comments are all older than step_completed_at — stale, not forcing")
                 else:
                     refresh = True
                     log.info("[Refresh] #pdca-refresh in tags, no approval can advance, and refresh is recent — forcing refresh")
@@ -1586,11 +1761,36 @@ def process_issue(
     if _handle_lifecycle_tags(state, tags, issue, owner, repo, number, state_dir, base_work_dir, comments):
         return
 
+    # ── Check-review phase ───────────────────────────────────────────────
+    # After Check completes, the runner waits for #check-approved before
+    # entering the decision phase.  This ensures the user has reviewed the
+    # Check output (Review.md, Test.md) and explicitly confirmed it.
+    if state.get("phase") == "check-review":
+        if "#check-approved" in tags:
+            # User confirmed the Check output — transition to decision phase
+            state["phase"] = "decision"
+            state["last_check"] = datetime.now(timezone.utc).isoformat()
+            save_state(state_dir, number, state)
+            _gh.add_comment(
+                owner, repo, number,
+                "**Act Step — Decision Required**\n\n"
+                "Check approved. Please add one of these tags in a new comment:\n"
+                f"- `#Deploy` — Merge changes into the `{DEPLOY_BRANCH}` branch\n"
+                "- `#Fix` — Review feedback and start a fix cycle\n"
+                "- `#Fallback` — Revert all changes",
+            )
+            log.info("Issue #%d: Check approved, entered decision phase", number)
+            return
+        # No #check-approved yet — wait for user input
+        state["last_check"] = datetime.now(timezone.utc).isoformat()
+        save_state(state_dir, number, state)
+        log.info("Issue #%d: awaiting #check-approved (phase=check-review)", number)
+        return
+
     # ── Decision phase ───────────────────────────────────────────────────
-    # After Check completes, the runner asks for a decision instead of
-    # proceeding to the Act step.  Decision tags (#deploy, #fix, #fallback)
-    # are handled here, before step resolution, so they short-circuit the
-    # normal approval chain.
+    # After #check-approved is received, the runner asks for a deployment
+    # decision.  Decision tags (#deploy, #fix, #fallback) are handled here,
+    # before step resolution, so they short-circuit the normal approval chain.
     if state.get("phase") == "decision":
         if _handle_decision_tag(state, tags, issue, owner, repo, number, state_dir, base_work_dir):
             return
@@ -1741,20 +1941,49 @@ def process_issue(
         extra_context = ""
         if step_to_execute == "plan":
             if refresh:
+                # Refresh: delete existing step files so the AI is forced to
+                # regenerate them from scratch rather than reporting they are
+                # "up-to-date".  The user explicitly requested regeneration
+                # via #pdca-refresh.
+                for fname in STEP_FILES[step_to_execute]:
+                    fp = step_dir / fname
+                    if fp.exists():
+                        fp.unlink()
+                        log.info("[Refresh] Deleted %s to force regeneration", fp)
                 # Refresh: pass ALL comments as context so AI can process
                 # user feedback, answers to outstanding questions, etc.
                 all_comment_ids = {c.get("id") for c in comments if not _gh.is_pdca_runner_comment(c)}
                 extra_context = build_consolidated_context(issue, comments, all_comment_ids)
+                extra_context += (
+                    "\n\n─── IMPORTANT ───────────────────────────────────────────\n"
+                    "The user has requested a REFRESH with #pdca-refresh.  You MUST\n"
+                    "regenerate ALL required files from scratch, incorporating ALL\n"
+                    "user comments and answers below.  Do NOT report that files are\n"
+                    "\"up-to-date\" — the user explicitly wants a fresh generation.\n"
+                )
                 log.info("[Refresh] Passing %d human comments as context for Plan regeneration", len(all_comment_ids))
             else:
                 new_comment_ids = {c.get("id") for c in new_comments} if new_comments else set()
                 extra_context = build_consolidated_context(issue, comments, new_comment_ids)
 
         # For non-Plan steps on refresh, also pass consolidated context
-        # so the AI can see user feedback.
+        # so the AI can see user feedback, and delete existing files to
+        # force regeneration.
         if step_to_execute != "plan" and refresh:
+            for fname in STEP_FILES[step_to_execute]:
+                fp = step_dir / fname
+                if fp.exists():
+                    fp.unlink()
+                    log.info("[Refresh] Deleted %s to force regeneration", fp)
             all_comment_ids = {c.get("id") for c in comments if not _gh.is_pdca_runner_comment(c)}
             extra_context = build_consolidated_context(issue, comments, all_comment_ids)
+            extra_context += (
+                "\n\n─── IMPORTANT ───────────────────────────────────────────\n"
+                "The user has requested a REFRESH with #pdca-refresh.  You MUST\n"
+                "regenerate ALL required files from scratch, incorporating ALL\n"
+                "user comments and answers below.  Do NOT report that files are\n"
+                "\"up-to-date\" — the user explicitly wants a fresh generation.\n"
+            )
             log.info("[Refresh] Passing %d human comments as context for %s regeneration",
                      len(all_comment_ids), step_to_execute)
 
@@ -1790,24 +2019,8 @@ def process_issue(
         )
 
         if ok and step_files_exist(step_dir, step_to_execute):
-            prev_step = state.get("current_step")
-            state["current_step"] = step_to_execute
-            if step_to_execute not in completed:
-                completed.append(step_to_execute)
-            state["completed_steps"] = completed
-            state["status"] = "active"
-            state["last_check"] = datetime.now(timezone.utc).isoformat()
-            save_state(state_dir, number, state)
-
-            # Record state transition for metrics
-            if _mt:
-                _mt.record_state_transition(
-                    number,
-                    from_state=prev_step or "idle",
-                    to_state=step_to_execute,
-                )
-
-            # Git commit + push for step output files
+            # Git commit + push BEFORE updating state, so if push fails
+            # the next poll cycle will retry rather than skip silently.
             generated = [step_dir / f for f in STEP_FILES[step_to_execute]]
             step_label = step_to_execute.capitalize()
 
@@ -1826,6 +2039,36 @@ def process_issue(
             slug = slugify(title)
             commit_msg = f"docs: PDCA {step_label} for #{number} — {title}"
             push_ok = git_commit_and_push(generated, commit_msg, base_work_dir)
+
+            # Update context hash so future polls won't re-execute the
+            # same step unless the issue/comments actually change.
+            current_hash = context_hash(issue, comments)
+            state[f"{step_to_execute}_context_hash"] = current_hash
+
+            prev_step = state.get("current_step")
+            state["current_step"] = step_to_execute
+            if step_to_execute not in completed:
+                completed.append(step_to_execute)
+            state["completed_steps"] = completed
+            state["status"] = "active"
+            state["last_check"] = datetime.now(timezone.utc).isoformat()
+            state["step_completed_at"] = datetime.now(timezone.utc).isoformat()
+            if not push_ok:
+                # Push failed — set flag so next poll cycle retries the push
+                # rather than silently skipping it.
+                state["push_pending"] = True
+                log.warning("Issue #%d: push pending — will retry on next poll cycle", number)
+            else:
+                state.pop("push_pending", None)
+            save_state(state_dir, number, state)
+
+            # Record state transition for metrics
+            if _mt:
+                _mt.record_state_transition(
+                    number,
+                    from_state=prev_step or "idle",
+                    to_state=step_to_execute,
+                )
 
             # Determine which output files actually exist — only generate
             # hyperlinks for files that were just created, not stale files
@@ -1894,30 +2137,37 @@ def process_issue(
             )
             log.info("Issue #%d: step '%s' done", number, step_to_execute)
 
-            # After Check step succeeds, enter decision phase asking user
-            # for Deploy / Fix / Fallback instead of proceeding to Act.
+            # After Check step succeeds, require explicit user approval
+            # (#check-approved) before advancing.  This gates the transition
+            # to the Act step and prevents the runner from skipping ahead
+            # without user confirmation.
             if step_to_execute == "check":
-                state["phase"] = "decision"
+                state["phase"] = "check-review"
                 state["last_check"] = datetime.now(timezone.utc).isoformat()
                 save_state(state_dir, number, state)
                 _gh.add_comment(
                     owner, repo, number,
-                    "**Act Step — Decision Required**\n\n"
-                    "Please add one of these tags in a new comment:\n"
-                    f"- `#Deploy` — Merge changes into the `{DEPLOY_BRANCH}` branch\n"
-                    "- `#Fix` — Review feedback and start a fix cycle\n"
-                    "- `#Fallback` — Revert all changes",
+                    "✅ **Check** completed — review pending.\n\n"
+                    "Please review **Review.md** and **Test.md**, then add "
+                    "`#check-approved` in a new comment to proceed to the Act step.",
                 )
-                log.info("Issue #%d: Check done, entered decision phase", number)
+                log.info("Issue #%d: Check done, awaiting #check-approved", number)
         else:
+            # run_skill failed OR required files were not generated.
+            # Distinguish the two cases for a clearer error message.
+            if not ok:
+                reason = "AI execution failed"
+            else:
+                missing = [f for f in STEP_FILES[step_to_execute] if not (step_dir / f).is_file()]
+                reason = f"files not generated: {', '.join(missing)}"
             _gh.add_comment(
                 owner,
                 repo,
                 number,
-                f"❌ **{step_to_execute.capitalize()}** step failed. "
+                f"❌ **{step_to_execute.capitalize()}** step failed ({reason}). "
                 f"Fix the issue then add a pdca-refresh tag to retry.",
             )
-            log.error("Issue #%d: step '%s' failed", number, step_to_execute)
+            log.error("Issue #%d: step '%s' failed — %s", number, step_to_execute, reason)
     else:
         # Manual mode — notify user once
         if state.get("current_step") != step_to_execute or refresh:
