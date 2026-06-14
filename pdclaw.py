@@ -1435,6 +1435,22 @@ def ensure_pdca_branch(
             cwd=str(repo_root), check=True, capture_output=True,
         )
         log.info("Created branch: %s", branch)
+
+        # Push the new branch to remote so GitHub links resolve immediately
+        try:
+            subprocess.run(
+                ["git", "push", "-u", "origin", branch],
+                cwd=str(repo_root), check=True, capture_output=True,
+                timeout=60,
+                env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+                stdin=subprocess.DEVNULL,
+            )
+            log.info("Pushed new branch to remote: %s", branch)
+        except subprocess.CalledProcessError as e:
+            stderr = e.stderr.decode() if isinstance(e.stderr, bytes) else str(e.stderr or "")
+            log.warning("Failed to push branch %s to remote: %s", branch, stderr[:200])
+            # Non-fatal: branch exists locally, user can push manually
+
         return branch
     except subprocess.CalledProcessError as e:
         stderr = e.stderr.decode() if isinstance(e.stderr, bytes) else str(e.stderr or "")
@@ -1870,13 +1886,41 @@ def process_issue(
     else:
         # Manual mode — notify user once
         if state.get("current_step") != step_to_execute or refresh:
+            # Create the PDCA feature branch even in manual mode so the
+            # user has a branch to work on once files are generated.
+            branch = ensure_pdca_branch(state, state_dir, number, title, base_work_dir)
+            if not branch:
+                log.error("Issue #%d: cannot proceed without PDCA branch", number)
+                _gh.add_comment(
+                    owner, repo, number,
+                    f"❌ **{step_to_execute.capitalize()}** failed: could not create or switch to PDCA branch.",
+                )
+                return
+
+            slug = slugify(title)
             files = ", ".join(STEP_FILES[step_to_execute])
+
+            # In manual mode files haven't been generated yet, so we show
+            # the branch link (which exists on GitHub) and the expected
+            # file paths — but no dead links to non-existent files.
+            branch_url = f"https://github.com/{owner}/{repo}/tree/{branch}"
+            output_dir = f"docs/{number}-{slug}/{step_to_execute}/"
+
+            plan_hint = ""
+            if step_to_execute == "plan":
+                plan_hint = (
+                    "\n\nReview **Design.md** for outstanding questions. "
+                    "Add a pdca-refresh tag after providing input to regenerate."
+                )
+
             _gh.add_comment(
                 owner,
                 repo,
                 number,
                 f"🔄 **{step_to_execute.capitalize()}** step ready.\n"
-                f"Run the `{SKILL_NAMES[step_to_execute]}` skill to generate: {files}",
+                f"Run the `{SKILL_NAMES[step_to_execute]}` skill to generate: {files}\n"
+                f"Branch: [`{branch}`]({branch_url}) → `{output_dir}`"
+                f"{plan_hint}",
             )
             state["current_step"] = step_to_execute
             state["last_check"] = datetime.now(timezone.utc).isoformat()
