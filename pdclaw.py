@@ -1735,11 +1735,28 @@ def process_issue(
             )
             return
 
-        # Build consolidated context with emphasis on new comments
+        # Build consolidated context with emphasis on new comments.
+        # On refresh, always pass ALL comments (including the user's feedback
+        # with answers to outstanding questions) so the AI can process them.
         extra_context = ""
         if step_to_execute == "plan":
-            new_comment_ids = {c.get("id") for c in new_comments} if new_comments else set()
-            extra_context = build_consolidated_context(issue, comments, new_comment_ids)
+            if refresh:
+                # Refresh: pass ALL comments as context so AI can process
+                # user feedback, answers to outstanding questions, etc.
+                all_comment_ids = {c.get("id") for c in comments if not _gh.is_pdca_runner_comment(c)}
+                extra_context = build_consolidated_context(issue, comments, all_comment_ids)
+                log.info("[Refresh] Passing %d human comments as context for Plan regeneration", len(all_comment_ids))
+            else:
+                new_comment_ids = {c.get("id") for c in new_comments} if new_comments else set()
+                extra_context = build_consolidated_context(issue, comments, new_comment_ids)
+
+        # For non-Plan steps on refresh, also pass consolidated context
+        # so the AI can see user feedback.
+        if step_to_execute != "plan" and refresh:
+            all_comment_ids = {c.get("id") for c in comments if not _gh.is_pdca_runner_comment(c)}
+            extra_context = build_consolidated_context(issue, comments, all_comment_ids)
+            log.info("[Refresh] Passing %d human comments as context for %s regeneration",
+                     len(all_comment_ids), step_to_execute)
 
         # Determine working directory and output location
         # Do runs from project root so it can modify code;
@@ -1755,7 +1772,14 @@ def process_issue(
         # Conversation continuity — reuse the same Claude session across
         # poll cycles for the same (issue, step) so the AI doesn't redo work.
         # /new-refresh or #pdca-new-session force a fresh start.
-        new_session = "#pdca-new-session" in tags or bool(NEW_SESSION_RE.search(comment_text))
+        # On #pdca-refresh, ALWAYS start a new session so the AI processes
+        # the user's feedback (answers to outstanding questions, etc.) with
+        # a clean context rather than being confused by old session history.
+        new_session = (
+            "#pdca-new-session" in tags
+            or bool(NEW_SESSION_RE.search(comment_text))
+            or refresh
+        )
         conv_path = _conv_path(state_dir, number, step_to_execute)
 
         # 使用会话模式执行（同一 Issue 的步骤间保持上下文）
@@ -1812,13 +1836,11 @@ def process_issue(
             # Build version lineage: branch name + GitHub permalink per output file.
             # Derive the path relative to the git repo root — base_work_dir may
             # be a subdirectory of the repo (e.g. "ai-crm/docs/..." not "docs/...").
-            # Use the PDCA branch name for a stable URL that points to the latest
-            # version. Only include version links when git push succeeded — without
-            # a successful push neither the commit nor the branch exist on GitHub.
+            # Include the commit hash for a stable version reference.
+            pdca_branch = state.get("pdca_branch") or f"pdca/{number}-{slug}"
             version_links = ""
             if push_ok:
                 try:
-                    pdca_branch = state.get("pdca_branch") or f"pdca/{number}-{slug}"
                     repo_result = subprocess.run(
                         ["git", "rev-parse", "--show-toplevel"],
                         cwd=str(base_work_dir), capture_output=True, text=True,
@@ -1832,12 +1854,25 @@ def process_issue(
                             f"{step_rel}/{f})"
                             for f in existing
                         ]
+                        # Also get the commit short hash for version tracking
+                        commit_result = subprocess.run(
+                            ["git", "rev-parse", "--short", "HEAD"],
+                            cwd=str(base_work_dir), capture_output=True, text=True,
+                        )
+                        commit_short = commit_result.stdout.strip() if commit_result.returncode == 0 else ""
+                        commit_info = f" (`{commit_short}`)" if commit_short else ""
                         version_links = (
-                            f"\nBranch: `{pdca_branch}` | "
+                            f"\nBranch: `{pdca_branch}`{commit_info} | "
                             f"{' · '.join(file_links)}"
                         )
                 except Exception:
                     pass
+            else:
+                # Push failed — still show local file paths so the user can
+                # find them, and mention the branch name for context.
+                version_links = (
+                    f"\nBranch: `{pdca_branch}` (local only — push failed)"
+                )
 
             # For Plan step, add hint about outstanding questions
             plan_hint = ""

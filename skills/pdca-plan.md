@@ -19,6 +19,24 @@ The following context has been accumulated from previous PDCA cycles and project
 3. **Generate Design.md and Impact.md** — Document the plan
 4. **Update Memory** — Record decisions, todos, and patterns
 
+## Regeneration / Refresh
+
+If this is a **regeneration** (the user has provided feedback, answered
+outstanding questions, or added a #pdca-refresh tag), you MUST:
+
+1. **Read the existing Design.md and Impact.md** first to understand what
+   was already generated.
+2. **Process all user comments** in the context — especially answers to
+   outstanding questions (e.g. "A: for now, let's proceed free-text").
+3. **Update the files** to incorporate the feedback:
+   - Move answered questions from "Outstanding Questions" into the relevant
+     design sections.
+   - Remove or update the "Outstanding Questions" section to reflect only
+     remaining unanswered items.
+   - If all questions are answered, remove the section entirely or mark it
+     as "All questions resolved".
+   - Update Impact.md if the decisions change the scope of changes.
+
 ## Output Files
 
 Generate exactly **two files** in the current working directory:
