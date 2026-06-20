@@ -1312,14 +1312,23 @@ def _handle_decision_tag(
 
     Returns True if a decision was processed (caller should return immediately).
     """
-    head_text = f"## Decision: "
+    head_text = f"**Decision** — "
 
     if "#deploy" in tags:
         branch = state.get("pdca_branch", "")
         target = DEPLOY_BRANCH
+
+        # If a previous deploy already merged but failed to push, don't
+        # re-merge — just let the push_pending retry logic handle it on
+        # the next poll cycle.
+        if state.get("push_pending") and state.get("push_pending_type") == "deploy":
+            log.info("Issue #%d: deploy already merged locally, push pending — skipping re-merge", number)
+            return True
+
         # Detect uncommitted changes that would block git checkout
         _dirty = False
         _stashed = False
+        deploy_failed = False
         try:
             status = subprocess.run(
                 ["git", "status", "--porcelain"],
@@ -1350,12 +1359,33 @@ def _handle_decision_tag(
                 ["git", "merge", branch, "--no-edit"],
                 cwd=str(base_work_dir), check=True, capture_output=True, timeout=30,
             )
-            subprocess.run(
-                ["git", "push", "-u", "origin", "HEAD"],
-                cwd=str(base_work_dir), check=True, capture_output=True, timeout=120,
-                env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
-                stdin=subprocess.DEVNULL,
-            )
+
+            # Push with retry for transient network failures
+            push_succeeded = False
+            for attempt in range(1, 4):
+                try:
+                    subprocess.run(
+                        ["git", "push", "-u", "origin", "HEAD"],
+                        cwd=str(base_work_dir),
+                        check=True,
+                        capture_output=True,
+                        timeout=120,
+                        env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+                        stdin=subprocess.DEVNULL,
+                    )
+                    push_succeeded = True
+                    break
+                except subprocess.TimeoutExpired:
+                    log.warning("Deploy git push timed out (attempt %d/3)", attempt)
+                except subprocess.CalledProcessError as e:
+                    stderr = e.stderr.decode() if isinstance(e.stderr, bytes) else str(e.stderr or "")
+                    log.warning("Deploy git push failed (attempt %d/3): %s", attempt, stderr[:200])
+                if attempt < 3:
+                    time.sleep(attempt * 10)
+
+            if not push_succeeded:
+                raise RuntimeError("git push failed after 3 attempts — network connectivity issue")
+
             log.info("Issue #%d: deployed — merged %s into %s", number, branch, target)
 
             # Return to the pdca branch and restore work-in-progress
@@ -1375,19 +1405,43 @@ def _handle_decision_tag(
             )
         except Exception as e:
             log.error("Issue #%d: deploy failed — %s", number, e)
+            # Try to recover: switch back to the PDCA branch
+            try:
+                subprocess.run(
+                    ["git", "checkout", branch],
+                    cwd=str(base_work_dir), capture_output=True, timeout=30,
+                )
+                if _stashed:
+                    subprocess.run(
+                        ["git", "stash", "pop"],
+                        cwd=str(base_work_dir), capture_output=True, timeout=30,
+                    )
+            except Exception:
+                pass
+            deploy_failed = True
             _gh.add_comment(
                 owner, repo, number,
-                f"{head_text}**Deploy** failed: {e}",
+                f"{head_text}**Deploy** failed — git push could not reach GitHub (network issue). "
+                f"The merge is committed locally on `{target}`. Will retry push on next poll cycle.",
             )
-        state["phase"] = None
-        if "act" not in state.get("completed_steps", []):
-            state.setdefault("completed_steps", []).append("act")
-        state["current_step"] = "act"
-        state["last_check"] = datetime.now(timezone.utc).isoformat()
-        save_state(state_dir, number, state)
-        _mt8 = get_metrics()
-        if _mt8:
-            _mt8.mark_issue_done(number)
+        if not deploy_failed:
+            state["phase"] = None
+            if "act" not in state.get("completed_steps", []):
+                state.setdefault("completed_steps", []).append("act")
+            state["current_step"] = "act"
+            state.pop("push_pending", None)
+            state["last_check"] = datetime.now(timezone.utc).isoformat()
+            save_state(state_dir, number, state)
+            _mt8 = get_metrics()
+            if _mt8:
+                _mt8.mark_issue_done(number)
+        else:
+            # Deploy failed — mark as push_pending so next poll cycle retries
+            state["push_pending"] = True
+            state["push_pending_type"] = "deploy"
+            state["last_check"] = datetime.now(timezone.utc).isoformat()
+            save_state(state_dir, number, state)
+            log.info("Issue #%d: deploy push pending — will retry on next poll cycle", number)
         return True
 
     if "#fix" in tags:
@@ -1606,9 +1660,24 @@ def process_issue(
 
     # Retry pending push from a previous cycle (e.g. transient network failure)
     if state.get("push_pending"):
-        log.info("Issue #%d: retrying pending git push", number)
+        log.info("Issue #%d: retrying pending git push (type=%s)", number, state.get("push_pending_type", "step"))
         pdca_branch = state.get("pdca_branch") or f"pdca/{number}-{slugify(issue.get('title', ''))}"
         push_retry_ok = False
+
+        # For deploy push retry, we may need to switch to the target branch first
+        # since the merge was already committed locally on the target branch.
+        push_pending_type = state.get("push_pending_type", "step")
+        if push_pending_type == "deploy":
+            target = DEPLOY_BRANCH
+            log.info("Issue #%d: deploy push retry — ensuring we're on branch '%s'", number, target)
+            try:
+                subprocess.run(
+                    ["git", "checkout", target],
+                    cwd=str(base_work_dir), capture_output=True, timeout=30,
+                )
+            except Exception:
+                log.warning("Issue #%d: could not checkout '%s' for deploy push retry", number, target)
+
         for attempt in range(1, 4):
             try:
                 subprocess.run(
@@ -1658,7 +1727,17 @@ def process_issue(
 
         if push_retry_ok:
             log.info("Issue #%d: pending push succeeded", number)
+            # If this was a deploy retry, also mark act as completed now
+            if push_pending_type == "deploy":
+                if "act" not in state.get("completed_steps", []):
+                    state.setdefault("completed_steps", []).append("act")
+                state["current_step"] = "act"
+                state["phase"] = None
+                _mt_retry = get_metrics()
+                if _mt_retry:
+                    _mt_retry.mark_issue_done(number)
             state.pop("push_pending", None)
+            state.pop("push_pending_type", None)
             save_state(state_dir, number, state)
         else:
             # Still failing — wait for next cycle to retry
@@ -2082,40 +2161,52 @@ def process_issue(
             # Include the commit hash for a stable version reference.
             pdca_branch = state.get("pdca_branch") or f"pdca/{number}-{slug}"
             version_links = ""
-            if push_ok:
-                try:
-                    repo_result = subprocess.run(
-                        ["git", "rev-parse", "--show-toplevel"],
+            try:
+                repo_result = subprocess.run(
+                    ["git", "rev-parse", "--show-toplevel"],
+                    cwd=str(base_work_dir), capture_output=True, text=True,
+                )
+                if repo_result.returncode == 0 and existing:
+                    repo_root = Path(repo_result.stdout.strip())
+                    step_rel = step_dir.resolve().relative_to(repo_root)
+                    file_links = [
+                        f"[`{f}`]"
+                        f"(https://github.com/{owner}/{repo}/blob/{pdca_branch}/"
+                        f"{step_rel}/{f})"
+                        for f in existing
+                    ]
+                    # Also get the commit short hash for version tracking
+                    commit_result = subprocess.run(
+                        ["git", "rev-parse", "--short", "HEAD"],
                         cwd=str(base_work_dir), capture_output=True, text=True,
                     )
-                    if repo_result.returncode == 0 and existing:
-                        repo_root = Path(repo_result.stdout.strip())
-                        step_rel = step_dir.resolve().relative_to(repo_root)
-                        file_links = [
-                            f"[`{f}`]"
-                            f"(https://github.com/{owner}/{repo}/blob/{pdca_branch}/"
-                            f"{step_rel}/{f})"
-                            for f in existing
-                        ]
-                        # Also get the commit short hash for version tracking
-                        commit_result = subprocess.run(
-                            ["git", "rev-parse", "--short", "HEAD"],
-                            cwd=str(base_work_dir), capture_output=True, text=True,
-                        )
-                        commit_short = commit_result.stdout.strip() if commit_result.returncode == 0 else ""
-                        commit_info = f" (`{commit_short}`)" if commit_short else ""
+                    commit_short = commit_result.stdout.strip() if commit_result.returncode == 0 else ""
+                    commit_info = f" (`{commit_short}`)" if commit_short else ""
+
+                    if push_ok:
                         version_links = (
                             f"\nBranch: `{pdca_branch}`{commit_info} | "
                             f"{' · '.join(file_links)}"
                         )
-                except Exception:
-                    pass
-            else:
-                # Push failed — still show local file paths so the user can
-                # find them, and mention the branch name for context.
-                version_links = (
-                    f"\nBranch: `{pdca_branch}` (local only — push failed)"
-                )
+                    else:
+                        # Push failed — still show hyperlinks to the branch
+                        # (which may exist locally) and mention the failure.
+                        version_links = (
+                            f"\nBranch: `{pdca_branch}` (local only — push failed){commit_info} | "
+                            f"{' · '.join(file_links)}"
+                        )
+            except Exception:
+                pass
+
+            # Fallback: if no version_links were generated (e.g. no git repo),
+            # still show the branch name with appropriate status.
+            if not version_links:
+                if push_ok:
+                    pass  # no links to show, branch info already implied
+                else:
+                    version_links = (
+                        f"\nBranch: `{pdca_branch}` (local only — push failed)"
+                    )
 
             # For Plan step, add hint about outstanding questions
             plan_hint = ""
