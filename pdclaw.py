@@ -2346,6 +2346,10 @@ def process_issue(
             )
             return
 
+        # Re-create step_dir after git checkout — the branch switch may have
+        # removed it if the directory didn't exist on the target branch.
+        step_dir.mkdir(parents=True, exist_ok=True)
+
         # Build consolidated context with emphasis on new comments.
         # On refresh, always pass ALL comments (including the user's feedback
         # with answers to outstanding questions) so the AI can process them.

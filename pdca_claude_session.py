@@ -214,6 +214,7 @@ def get_session(issue_number: int, work_dir: Path,
     """获取或创建 issue 对应的会话
 
     每个 issue 有独立的会话，新 issue 自动创建全新会话。
+    不同 PDCA 步骤可能在不同目录运行，因此每次调用都更新 work_dir。
     """
     if issue_number not in _sessions:
         _sessions[issue_number] = ClaudeSession(
@@ -223,6 +224,10 @@ def get_session(issue_number: int, work_dir: Path,
             model=model,
             base_url=base_url,
         )
+    else:
+        # Update work_dir for the current step — different PDCA steps
+        # (plan/do/check/act) may run in different directories.
+        _sessions[issue_number].work_dir = Path(work_dir)
     return _sessions[issue_number]
 
 
