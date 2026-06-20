@@ -172,7 +172,7 @@ Add these tags as comments on a GitHub issue. PDClaw detects them and advances t
 | `#plan-approved` | **Do** | `pdca-do` | `Change.md` |
 | `#do-approved` | **Check** | `pdca-check` | `Review.md`, `Test.md` |
 | `#check-approved` | **Check** | `pdca-check` | Runs Check, then enters decision phase |
-| `#act-approved` | **Act** | `pdca-act` | `Decision.md` (rarely used — decision phase replaces this) |
+| `#act-approved` | **Act** | `pdca-act` | `Decision.md`, `CodeDiff.md` (rarely used — decision phase replaces this) |
 
 > **Why is Act rarely used?** After the Check step succeeds, PDClaw enters a *decision phase* that asks you to choose `#Deploy`, `#Fix`, or `#Fallback`. This manual decision replaces the automated Act step in normal flow. The `#act-approved` tag and `pdca-act` skill exist for backward compatibility and edge cases where explicit Act execution is desired.
 
@@ -180,11 +180,13 @@ Add these tags as comments on a GitHub issue. PDClaw detects them and advances t
 
 After a successful Check, PDClaw posts a comment asking for a decision. Reply with one of:
 
-| Tag | Effect |
-|---|---|
-| `#Deploy` | Merge `pdca/<issue#>-<slug>` branch into the configured deploy branch |
-| `#Fix` | Reset to Do step — include feedback in your comment as context for the next iteration |
-| `#Fallback` | Revert all changes and delete the PDCA feature branch |
+| Tag | Effect | Act Artifacts |
+|---|---|---|
+| `#Deploy` | Merge `pdca/<issue#>-<slug>` branch into the configured deploy branch | `Decision.md` + `CodeDiff.md` (with full diff report) |
+| `#Fix` | Reset to Do step — include feedback in your comment as context for the next iteration | `Decision.md` |
+| `#Fallback` | Revert all changes and delete the PDCA feature branch | `Decision.md` |
+
+All decision tags generate `Decision.md` in `docs/<issue#>-<slug>/act/`. The `#Deploy` tag additionally generates `CodeDiff.md` containing the full code diff of what was merged.
 
 ### Control Tags
 
@@ -329,9 +331,12 @@ pdca/42-add-payment-gateway/
         │   └── Impact.md
         ├── do/
         │   └── Change.md
-        └── check/
-            ├── Review.md
-            └── Test.md
+        ├── check/
+        │   ├── Review.md
+        │   └── Test.md
+        └── act/
+            ├── Decision.md
+            └── CodeDiff.md    (Deploy only)
 ```
 
 - PDClaw auto-creates the branch from the deploy branch

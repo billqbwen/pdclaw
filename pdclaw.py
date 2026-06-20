@@ -63,7 +63,7 @@ STEP_FILES: dict[str, list[str]] = {
     "plan": ["Design.md", "Impact.md"],
     "do": ["Change.md"],
     "check": ["Review.md", "Test.md"],
-    "act": ["Decision.md"],
+    "act": ["Decision.md", "CodeDiff.md"],
 }
 
 SKILL_NAMES: dict[str, str] = {
@@ -1297,6 +1297,227 @@ def _handle_lifecycle_tags(
     return False
 
 
+# ── Act step artifact generation ──────────────────────────────────────────────
+
+
+def _generate_act_artifacts(
+    state: dict,
+    decision: str,
+    issue: dict,
+    owner: str,
+    repo: str,
+    number: int,
+    base_work_dir: Path,
+    branch: str,
+    target_branch: str,
+) -> None:
+    """Generate Decision.md and (for Deploy) CodeDiff.md in the act folder,
+    then commit and push them to the PDCA branch.
+
+    Args:
+        decision: One of "Deploy", "Fix", "Fallback"
+        branch: The PDCA feature branch name
+        target_branch: The deploy target branch (e.g. main)
+    """
+    title = issue.get("title", "")
+    act_dir = step_output_dir(base_work_dir, number, title, "act")
+    act_dir.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    issue_url = issue.get("html_url", "")
+
+    # ── 1. Generate Decision.md ──────────────────────────────────────────
+    decision_body = (
+        f"# PDCA Decision Report\n\n"
+        f"## Issue\n\n"
+        f"- **Issue**: [#{number}]({issue_url}) — {title}\n"
+        f"- **Decision**: **{decision}**\n"
+        f"- **Timestamp**: {timestamp}\n"
+        f"- **PDCA Branch**: `{branch}`\n"
+        f"- **Target Branch**: `{target_branch}`\n\n"
+        f"## Decision Summary\n\n"
+    )
+
+    if decision == "Deploy":
+        decision_body += (
+            f"The PDCA cycle completed successfully. "
+            f"Changes in `{branch}` have been merged into `{target_branch}` and pushed to the remote.\n\n"
+            f"All review and test artifacts have been approved.\n"
+        )
+    elif decision == "Fix":
+        decision_body += (
+            f"The PDCA cycle requires additional changes. "
+            f"The Do step will be re-entered with the feedback provided in the decision comment.\n\n"
+            f"Previous Do and Check outputs have been discarded. Plan artifacts are retained.\n"
+        )
+    elif decision == "Fallback":
+        decision_body += (
+            f"The PDCA cycle has been rolled back. "
+            f"Branch `{branch}` has been deleted and all changes have been reverted to `{target_branch}`.\n\n"
+            f"No changes from this cycle remain in the repository.\n"
+        )
+
+    decision_body += (
+        f"\n## PDCA Cycle Summary\n\n"
+        f"- **Plan**: `docs/{number}-{slugify(title)}/plan/` (Design.md, Impact.md)\n"
+        f"- **Do**: `docs/{number}-{slugify(title)}/do/` (Change.md)\n"
+        f"- **Check**: `docs/{number}-{slugify(title)}/check/` (Review.md, Test.md)\n"
+        f"- **Act**: This document\n\n"
+        f"## Completed Steps\n\n"
+    )
+    for step in state.get("completed_steps", []):
+        decision_body += f"- [x] {step.capitalize()}\n"
+
+    decision_path = act_dir / "Decision.md"
+    decision_path.write_text(decision_body)
+    log.info("Issue #%d: generated Decision.md in %s", number, act_dir)
+
+    # ── 2. Generate CodeDiff.md (Deploy only) ────────────────────────────
+    diff_path = act_dir / "CodeDiff.md"
+    if decision == "Deploy":
+        diff_content = _generate_code_diff_report(
+            branch, target_branch, base_work_dir, number, title, timestamp
+        )
+        diff_path.write_text(diff_content)
+        log.info("Issue #%d: generated CodeDiff.md in %s", number, act_dir)
+    else:
+        # For Fix/Fallback, generate a minimal CodeDiff.md noting no merge occurred
+        diff_content = (
+            f"# Code Diff Report\n\n"
+            f"**Decision**: {decision} — no merge performed.\n\n"
+            f"- **Issue**: [#{number}]({issue_url}) — {title}\n"
+            f"- **Timestamp**: {timestamp}\n"
+        )
+        diff_path.write_text(diff_content)
+
+    # ── 3. Commit and push to the PDCA branch ────────────────────────────
+    # We must be on the PDCA branch for the commit
+    _commit_act_artifacts(act_dir, branch, number, decision, base_work_dir)
+
+
+def _generate_code_diff_report(
+    branch: str,
+    target_branch: str,
+    base_work_dir: Path,
+    number: int,
+    title: str,
+    timestamp: str,
+) -> str:
+    """Generate a CodeDiff.md report showing what was merged from the PDCA
+    branch into the target branch."""
+    diff_lines: list[str] = []
+    diff_lines.append(f"# Code Diff Report — Deploy Merge\n")
+    diff_lines.append(f"\n- **Issue**: #{number} — {title}")
+    diff_lines.append(f"- **Source Branch**: `{branch}`")
+    diff_lines.append(f"- **Target Branch**: `{target_branch}`")
+    diff_lines.append(f"- **Timestamp**: {timestamp}\n")
+
+    # Collect diff stats from the merge
+    try:
+        # git diff between target_branch and the PDCA branch (before merge)
+        stat_result = subprocess.run(
+            ["git", "diff", "--stat", f"{target_branch}...{branch}"],
+            cwd=str(base_work_dir), capture_output=True, text=True, timeout=30,
+        )
+        if stat_result.returncode == 0 and stat_result.stdout.strip():
+            diff_lines.append("## File Summary\n")
+            diff_lines.append("```")
+            diff_lines.append(stat_result.stdout.strip())
+            diff_lines.append("```\n")
+        else:
+            diff_lines.append("## File Summary\n\n(No file changes detected between branches)\n")
+    except Exception as e:
+        log.warning("Issue #%d: git diff --stat failed: %s", number, e)
+        diff_lines.append("## File Summary\n\n(Unable to compute diff stats)\n")
+
+    # Collect file-level diff
+    try:
+        full_diff = subprocess.run(
+            ["git", "diff", f"{target_branch}...{branch}"],
+            cwd=str(base_work_dir), capture_output=True, text=True, timeout=60,
+        )
+        if full_diff.returncode == 0 and full_diff.stdout.strip():
+            diff_lines.append("## Detailed Changes\n")
+            diff_lines.append("```diff")
+            diff_lines.append(full_diff.stdout.strip())
+            diff_lines.append("```")
+        else:
+            diff_lines.append("## Detailed Changes\n\n(No detailed diff available)\n")
+    except Exception as e:
+        log.warning("Issue #%d: git diff failed: %s", number, e)
+        diff_lines.append("## Detailed Changes\n\n(Unable to generate diff)\n")
+
+    return "\n".join(diff_lines)
+
+
+def _commit_act_artifacts(
+    act_dir: Path,
+    branch: str,
+    number: int,
+    decision: str,
+    base_work_dir: Path,
+) -> None:
+    """Commit and push the act artifacts (Decision.md, CodeDiff.md) to the
+    PDCA branch on GitHub."""
+    try:
+        # Switch to the PDCA branch
+        subprocess.run(
+            ["git", "checkout", branch],
+            cwd=str(base_work_dir), capture_output=True, timeout=30,
+        )
+
+        # Stage the act files
+        generated = [act_dir / "Decision.md", act_dir / "CodeDiff.md"]
+        existing = [f for f in generated if f.is_file()]
+        if not existing:
+            log.warning("Issue #%d: no act artifacts to commit", number)
+            return
+
+        subprocess.run(
+            ["git", "add", "--"] + [str(f) for f in existing],
+            cwd=str(base_work_dir), check=True, capture_output=True,
+        )
+
+        # Check if there are staged changes
+        diff_check = subprocess.run(
+            ["git", "diff", "--staged", "--quiet"],
+            cwd=str(base_work_dir), capture_output=True,
+        )
+        if diff_check.returncode == 0:
+            log.info("Issue #%d: no new act changes to commit", number)
+            return
+
+        # Commit
+        commit_msg = f"docs: PDCA Act for #{number} — decision {decision}"
+        subprocess.run(
+            ["git", "-c", "commit.gpgsign=false", "commit", "-m", commit_msg],
+            cwd=str(base_work_dir), check=True, capture_output=True,
+        )
+
+        # Push
+        for attempt in range(1, 4):
+            try:
+                subprocess.run(
+                    ["git", "push", "-u", "origin", "HEAD"],
+                    cwd=str(base_work_dir), check=True, capture_output=True,
+                    timeout=120,
+                    env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+                    stdin=subprocess.DEVNULL,
+                )
+                log.info("Issue #%d: act artifacts pushed to %s", number, branch)
+                return
+            except subprocess.TimeoutExpired:
+                log.warning("Issue #%d: act push timed out (attempt %d/3)", number, attempt)
+            except subprocess.CalledProcessError as e:
+                stderr = e.stderr.decode() if isinstance(e.stderr, bytes) else str(e.stderr or "")
+                log.warning("Issue #%d: act push failed (attempt %d/3): %s", number, attempt, stderr[:200])
+            if attempt < 3:
+                time.sleep(attempt * 10)
+
+        log.warning("Issue #%d: act push failed after 3 attempts", number)
+    except Exception as e:
+        log.error("Issue #%d: failed to commit act artifacts: %s", number, e)
+
 
 def _handle_decision_tag(
     state: dict,
@@ -1399,9 +1620,20 @@ def _handle_decision_tag(
                     cwd=str(base_work_dir), capture_output=True, timeout=30,
                 )
 
+            # Generate Act artifacts (Decision.md + CodeDiff.md) and push
+            # to the PDCA branch before updating state
+            try:
+                _generate_act_artifacts(
+                    state, "Deploy", issue, owner, repo, number,
+                    base_work_dir, branch, target,
+                )
+            except Exception as act_err:
+                log.error("Issue #%d: failed to generate act artifacts: %s", number, act_err)
+
             _gh.add_comment(
                 owner, repo, number,
-                f"{head_text}**Deploy** — merged `{branch}` into `{target}` and pushed.",
+                f"{head_text}**Deploy** — merged `{branch}` into `{target}` and pushed.\n"
+                f"Act artifacts: `Decision.md` and `CodeDiff.md` generated in `docs/{number}-{slugify(issue.get('title', ''))}/act/`.",
             )
         except Exception as e:
             log.error("Issue #%d: deploy failed — %s", number, e)
@@ -1445,6 +1677,18 @@ def _handle_decision_tag(
         return True
 
     if "#fix" in tags:
+        branch = state.get("pdca_branch", "")
+        target = DEPLOY_BRANCH
+
+        # Generate Act artifacts (Decision.md + CodeDiff.md) documenting the Fix decision
+        try:
+            _generate_act_artifacts(
+                state, "Fix", issue, owner, repo, number,
+                base_work_dir, branch, target,
+            )
+        except Exception as act_err:
+            log.error("Issue #%d: failed to generate act artifacts for Fix: %s", number, act_err)
+
         # Reset to re-enter the Do step — keep Plan but remove Do and Check
         state["completed_steps"] = ["plan"]
         state["current_step"] = None
@@ -1455,7 +1699,8 @@ def _handle_decision_tag(
         _gh.add_comment(
             owner, repo, number,
             f"{head_text}**Fix** — cycle reset to Do step. "
-            f"Review the feedback above, then add `#plan-approved` to re-enter the Do step.",
+            f"Review the feedback above, then add `#plan-approved` to re-enter the Do step.\n"
+            f"Act artifact `Decision.md` generated in `docs/{number}-{slugify(issue.get('title', ''))}/act/`.",
         )
         log.info("Issue #%d: fix cycle started (reset to Do step)", number)
         return True
@@ -1463,6 +1708,17 @@ def _handle_decision_tag(
     if "#fallback" in tags:
         branch = state.get("pdca_branch", "")
         base_branch = state.get("base_branch", "main")
+        target = DEPLOY_BRANCH
+
+        # Generate Act artifacts BEFORE deleting the branch (need the branch for diff)
+        try:
+            _generate_act_artifacts(
+                state, "Fallback", issue, owner, repo, number,
+                base_work_dir, branch, target,
+            )
+        except Exception as act_err:
+            log.error("Issue #%d: failed to generate act artifacts for Fallback: %s", number, act_err)
+
         try:
             # Discard the pdca branch and go back to base
             subprocess.run(
@@ -1481,7 +1737,8 @@ def _handle_decision_tag(
             log.info("Issue #%d: fallback — reverted to %s, deleted %s", number, base_branch, branch)
             _gh.add_comment(
                 owner, repo, number,
-                f"{head_text}**Fallback** — reverted to `{base_branch}` and deleted `{branch}`.",
+                f"{head_text}**Fallback** — reverted to `{base_branch}` and deleted `{branch}`.\n"
+                f"Act artifact `Decision.md` generated in `docs/{number}-{slugify(issue.get('title', ''))}/act/`.",
             )
         except Exception as e:
             log.error("Issue #%d: fallback failed — %s", number, e)

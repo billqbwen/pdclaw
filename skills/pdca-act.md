@@ -1,5 +1,5 @@
 ---
-description: PDCA Act with Memory — final assessment, generate Decision.md, archive learnings
+description: PDCA Act with Memory — final assessment, generate Decision.md + CodeDiff.md, archive learnings
 ---
 
 You are executing the **Act** step of the PDCA cycle. **Do NOT modify code** — assessment only.
@@ -14,8 +14,9 @@ You are executing the **Act** step of the PDCA cycle. **Do NOT modify code** —
 
 1. **Read all PDCA artifacts** — Design.md, Impact.md, Change.md, Review.md, Test.md
 2. **Evaluate the cycle** — Did it achieve its goal?
-3. **Generate Decision.md** — Final decision
-4. **Update Memory** — Archive learnings, update global patterns
+3. **Generate Decision.md** — Final decision report
+4. **Generate CodeDiff.md** — Code diff summary of what was merged (Deploy only)
+5. **Update Memory** — Archive learnings, update global patterns
 
 ## Output File: Decision.md
 
@@ -27,6 +28,12 @@ You are executing the **Act** step of the PDCA cycle. **Do NOT modify code** —
 - **Lessons Learned** — What went well, what to improve
 - **Next Steps** — Deployment plan or rollback guidance
 - **Sign-Off** — Cycle complete confirmation
+
+## Output File: CodeDiff.md (Deploy only)
+
+Generated automatically by PDClaw after a `#Deploy` decision:
+- **File Summary** — `git diff --stat` showing changed files and line counts
+- **Detailed Changes** — Full `git diff` between the PDCA branch and the deploy target
 
 ## Memory Commands
 
