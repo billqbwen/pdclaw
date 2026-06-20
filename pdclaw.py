@@ -5,11 +5,13 @@ PDClaw — GitHub Issue PDCA Cycle Automation
 Polls GitHub issues for PDCA tags and executes Plan-Do-Check-Act cycles.
 
 Tags in GitHub issue bodies:
-  #pdca-start                — start PDCA process (maps to Plan step)
-  #plan-approved             — trigger the Plan step
-  #do-approved               — trigger the Do step
-  #check-approved            — trigger the Check step
-  #act-approved              — trigger the Act step
+  #pdca-start                — start PDCA cycle (triggers Plan step)
+  #plan-approved             — approve Plan output, advance to Do step
+  #do-approved               — approve Do output, advance to Check step
+  #check-approved            — approve Check output, enter decision phase
+  #deploy                    — (decision phase) merge changes into target branch
+  #fix                       — (decision phase) reset to Do step for fixes
+  #fallback                  — (decision phase) revert all changes
   #pdca-refresh              — re-run the current step
   #pdca-abort                — stop processing this issue
   #pdca-close                — close the GitHub issue
@@ -269,19 +271,6 @@ def get_tags(text: str) -> set[str]:
     return {f"#{m.group(1).lower()}" for m in TAG_RE.finditer(text)}
 
 
-def get_step_from_tags(tags: set[str]) -> str | None:
-    """Map a tag to its associated step regardless of completion status."""
-    if "#plan-approved" in tags or "#pdca-start" in tags:
-        return "plan"
-    if "#do-approved" in tags:
-        return "do"
-    if "#check-approved" in tags:
-        return "check"
-    if "#act-approved" in tags:
-        return "act"
-    return None
-
-
 def resolve_next_step(tags: set[str], completed_steps: list[str]) -> str | None:
     """Determine which PDCA step to execute based on approval chain and state.
 
@@ -290,10 +279,12 @@ def resolve_next_step(tags: set[str], completed_steps: list[str]) -> str | None:
       #plan-approved       → Plan confirmed by user; advance to Do
       #do-approved         → Do confirmed by user; advance to Check
       #check-approved      → Check confirmed by user; advance to Act
-      #act-approved        → Act confirmed; nothing left to execute
+                            (intercepted by check-review phase handler;
+                             use #Deploy/#Fix/#Fallback in decision phase)
 
-    Each -approved tag also implies the step itself should run if it hasn't yet.
-    Sequential ordering is enforced: a step only runs if all predecessors are done.
+    Each -approved tag implies the approved step should run first (if it hasn't
+    yet), then advance to the next step.  Sequential ordering is enforced: a
+    step only runs if all predecessors are done.
 
     NOTE: #check-approved is intercepted by the check-review phase handler
     (in process_issue) before this function is reached.  If this function IS
@@ -312,12 +303,16 @@ def resolve_next_step(tags: set[str], completed_steps: list[str]) -> str | None:
         confirmed_order.append("do")
 
     if "#do-approved" in tags:
+        if "do" not in confirmed_order:
+            confirmed_order.append("do")
         confirmed_order.append("check")
 
     # #check-approved advances to act, BUT the check-review phase handler
     # (in process_issue) will intercept this tag first and transition to
     # the decision phase rather than jumping straight to the act step.
     if "#check-approved" in tags:
+        if "check" not in confirmed_order:
+            confirmed_order.append("check")
         confirmed_order.append("act")
 
     # First uncompleted step in the confirmed chain is what to execute
@@ -349,60 +344,14 @@ PDCA_RUNNER_MARKER = "<!-- pdclaw -->"
 # Pattern to detect PDClaw comments by the marker
 PDCA_RUNNER_MARKER_PATTERNS = re.compile(r"<!-- pdclaw -->", re.IGNORECASE)
 
-# Patterns indicating meaningful user input (answers, updates, feedback)
-MEANINGFUL_INPUT_PATTERNS = re.compile(
-    r"(?i)(answer|answered|here is|here's|updated|fix|fixed|resolved|yes|no|"
-    r"#pdca-|\?|question|feedback|comment|response|reply|provided|added)",
-    re.DOTALL,
-)
-
 # Comments starting with these prefixes will NOT be processed even if they contain tags
 # Use to discuss tags without triggering actions: "what about #pdca-refresh?"
-IGNORE_COMMENT_PREFIXES = ("[skip]", "<!--", "noreview:", "no-action:", "# no-trigger")
 IGNORE_COMMENT_PATTERNS = re.compile(r"^\s*(\[skip\]|<!--|noreview:|no-action:|#\s*no-trigger)", re.IGNORECASE)
 
 # Minimum content length to consider as meaningful (avoid empty/very short comments)
 MIN_COMMENT_LENGTH = 10
 
 
-def is_meaningful_comment(comment: dict, assignee_login: str | None = None) -> bool:
-    """Check if a comment contains meaningful input that warrants AI processing.
-
-    Filters out:
-    - Comments from PDClaw itself (via hidden marker)
-    - Very short/empty comments
-    - Bot/auto-generated comments
-    """
-    body = comment.get("body") or ""
-    author = comment.get("user", {}).get("login", "")
-
-    # Skip comments from PDClaw itself
-    if _gh.is_pdca_runner_comment(comment):
-        return False
-
-    # Skip comments with ignore prefix (allows discussing tags without triggering)
-    if IGNORE_COMMENT_PATTERNS.search(body):
-        return False
-
-    # Skip very short comments
-    clean_body = re.sub(r"\[.*?\]\(.*?\)|[#*`>_\-~]|```[\s\S]*?```", "", body).strip()
-    if len(clean_body) < MIN_COMMENT_LENGTH:
-        return False
-
-    # Skip known bot accounts
-    if author.endswith("[bot]") or author in ("web-flow", "github-actions[bot]"):
-        return False
-
-    # If author is the assignee, consider meaningful (they're providing updates)
-    if assignee_login and author == assignee_login:
-        return True
-
-    # If comment contains PDCA tags, it's meaningful regardless of author
-    if get_tags(body):
-        return True
-
-    # Otherwise, require meaningful content patterns
-    return bool(MEANINGFUL_INPUT_PATTERNS.search(body))
 
 
 def issue_content_changed(state: dict, issue: dict) -> bool:
@@ -1283,10 +1232,19 @@ def _handle_lifecycle_tags(
         return True
 
     if "#pdca-new-session" in tags:
+        # Only process from NEW human comments — old/stale
+        # new-session comments that were already handled should not re-trigger.
+        new_human, _ = get_new_human_comments(state, comments or [])
+        new_session_in_new = any(
+            "#pdca-new-session" in get_tags(c.get("body", ""))
+            for c in new_human
+        )
+        if not new_session_in_new:
+            log.info("Issue #%d: #pdca-new-session in old comments only, skipping (already handled)", number)
+            return False
+
         # 仅重置 Claude 会话，不清除状态和记忆
         reset_session(number, base_work_dir, state_dir)
-        state["new_session"] = True  # 标记下次执行使用新会话
-        save_state(state_dir, number, state)
         _gh.add_comment(
             owner, repo, number,
             f"🆕 **New Session** — Claude session for issue #{number} has been reset. "
@@ -1311,7 +1269,7 @@ def _generate_act_artifacts(
     base_work_dir: Path,
     branch: str,
     target_branch: str,
-) -> None:
+) -> bool:
     """Generate Decision.md and (for Deploy) CodeDiff.md in the act folder,
     then commit and push them to the PDCA branch.
 
@@ -1393,7 +1351,7 @@ def _generate_act_artifacts(
 
     # ── 3. Commit and push to the PDCA branch ────────────────────────────
     # We must be on the PDCA branch for the commit
-    _commit_act_artifacts(act_dir, branch, number, decision, base_work_dir)
+    return _commit_act_artifacts(act_dir, branch, number, decision, base_work_dir)
 
 
 def _generate_code_diff_report(
@@ -1457,22 +1415,31 @@ def _commit_act_artifacts(
     number: int,
     decision: str,
     base_work_dir: Path,
-) -> None:
+) -> bool:
     """Commit and push the act artifacts (Decision.md, CodeDiff.md) to the
-    PDCA branch on GitHub."""
+    PDCA branch on GitHub.
+
+    Returns True if the artifacts were committed AND pushed successfully.
+    Returns False if any step failed (the commit may still exist locally).
+    """
     try:
-        # Switch to the PDCA branch
-        subprocess.run(
-            ["git", "checkout", branch],
-            cwd=str(base_work_dir), capture_output=True, timeout=30,
-        )
+        # Switch to the PDCA branch (only if not already on it)
+        current_branch = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=str(base_work_dir), capture_output=True, text=True, timeout=10,
+        ).stdout.strip()
+        if current_branch != branch:
+            subprocess.run(
+                ["git", "checkout", branch],
+                cwd=str(base_work_dir), capture_output=True, timeout=30,
+            )
 
         # Stage the act files
         generated = [act_dir / "Decision.md", act_dir / "CodeDiff.md"]
         existing = [f for f in generated if f.is_file()]
         if not existing:
             log.warning("Issue #%d: no act artifacts to commit", number)
-            return
+            return True  # Nothing to do isn't a failure
 
         subprocess.run(
             ["git", "add", "--"] + [str(f) for f in existing],
@@ -1486,7 +1453,7 @@ def _commit_act_artifacts(
         )
         if diff_check.returncode == 0:
             log.info("Issue #%d: no new act changes to commit", number)
-            return
+            return True
 
         # Commit
         commit_msg = f"docs: PDCA Act for #{number} — decision {decision}"
@@ -1506,7 +1473,7 @@ def _commit_act_artifacts(
                     stdin=subprocess.DEVNULL,
                 )
                 log.info("Issue #%d: act artifacts pushed to %s", number, branch)
-                return
+                return True
             except subprocess.TimeoutExpired:
                 log.warning("Issue #%d: act push timed out (attempt %d/3)", number, attempt)
             except subprocess.CalledProcessError as e:
@@ -1515,9 +1482,11 @@ def _commit_act_artifacts(
             if attempt < 3:
                 time.sleep(attempt * 10)
 
-        log.warning("Issue #%d: act push failed after 3 attempts", number)
+        log.warning("Issue #%d: act push failed after 3 attempts — commit exists locally but not on remote", number)
+        return False
     except Exception as e:
         log.error("Issue #%d: failed to commit act artifacts: %s", number, e)
+        return False
 
 
 def _handle_decision_tag(
@@ -1571,7 +1540,7 @@ def _handle_decision_tag(
                 cwd=str(base_work_dir), capture_output=True, text=True,
             )
             if checkout.returncode != 0:
-                base = state.get("base_branch", "main")
+                base = state.get("base_branch", DEPLOY_BRANCH)
                 log.info("Deploy: target '%s' not found, creating from '%s'", target, base)
                 subprocess.run(
                     ["git", "checkout", "-b", target, base],
@@ -1623,19 +1592,29 @@ def _handle_decision_tag(
 
             # Generate Act artifacts (Decision.md + CodeDiff.md) and push
             # to the PDCA branch before updating state
+            act_artifacts_ok = True
             try:
-                _generate_act_artifacts(
+                act_artifacts_ok = _generate_act_artifacts(
                     state, "Deploy", issue, owner, repo, number,
                     base_work_dir, branch, target,
                 )
             except Exception as act_err:
                 log.error("Issue #%d: failed to generate act artifacts: %s", number, act_err)
+                act_artifacts_ok = False
 
-            _gh.add_comment(
-                owner, repo, number,
-                f"{head_text}**Deploy** — merged `{branch}` into `{target}` and pushed.\n"
-                f"Act artifacts: `Decision.md` and `CodeDiff.md` generated in `docs/{number}-{slugify(issue.get('title', ''))}/act/`.",
-            )
+            if act_artifacts_ok:
+                _gh.add_comment(
+                    owner, repo, number,
+                    f"{head_text}**Deploy** — merged `{branch}` into `{target}` and pushed.\n"
+                    f"Act artifacts: `Decision.md` and `CodeDiff.md` generated in "
+                    f"`docs/{number}-{slugify(issue.get('title', ''))}/act/`.",
+                )
+            else:
+                _gh.add_comment(
+                    owner, repo, number,
+                    f"{head_text}**Deploy** — merged `{branch}` into `{target}` and pushed.\n"
+                    f"Warning: act artifacts could not be generated (see logs).",
+                )
         except Exception as e:
             log.error("Issue #%d: deploy failed — %s", number, e)
             # Try to recover: switch back to the PDCA branch
@@ -1683,10 +1662,12 @@ def _handle_decision_tag(
 
         # Generate Act artifacts (Decision.md + CodeDiff.md) documenting the Fix decision
         try:
-            _generate_act_artifacts(
+            act_push_ok = _generate_act_artifacts(
                 state, "Fix", issue, owner, repo, number,
                 base_work_dir, branch, target,
             )
+            if not act_push_ok:
+                log.warning("Issue #%d: fix act artifacts committed locally but push failed", number)
         except Exception as act_err:
             log.error("Issue #%d: failed to generate act artifacts for Fix: %s", number, act_err)
 
@@ -1697,12 +1678,20 @@ def _handle_decision_tag(
         state["last_check"] = datetime.now(timezone.utc).isoformat()
         reset_session(number, base_work_dir, state_dir)
         save_state(state_dir, number, state)
-        _gh.add_comment(
-            owner, repo, number,
-            f"{head_text}**Fix** — cycle reset to Do step. "
-            f"Review the feedback above, then add `#plan-approved` to re-enter the Do step.\n"
-            f"Act artifact `Decision.md` generated in `docs/{number}-{slugify(issue.get('title', ''))}/act/`.",
-        )
+        if act_push_ok:
+            _gh.add_comment(
+                owner, repo, number,
+                f"{head_text}**Fix** — cycle reset to Do step. "
+                f"Review the feedback above, then add `#plan-approved` to re-enter the Do step.\n"
+                f"Act artifact `Decision.md` generated in `docs/{number}-{slugify(issue.get('title', ''))}/act/`.",
+            )
+        else:
+            _gh.add_comment(
+                owner, repo, number,
+                f"{head_text}**Fix** — cycle reset to Do step. "
+                f"Review the feedback above, then add `#plan-approved` to re-enter the Do step.\n"
+                f"Warning: act artifacts could not be generated or pushed (see logs).",
+            )
         log.info("Issue #%d: fix cycle started (reset to Do step)", number)
         return True
 
@@ -1713,10 +1702,12 @@ def _handle_decision_tag(
 
         # Generate Act artifacts BEFORE deleting the branch (need the branch for diff)
         try:
-            _generate_act_artifacts(
+            act_push_ok = _generate_act_artifacts(
                 state, "Fallback", issue, owner, repo, number,
                 base_work_dir, branch, target,
             )
+            if not act_push_ok:
+                log.warning("Issue #%d: fallback act artifacts committed locally but push failed", number)
         except Exception as act_err:
             log.error("Issue #%d: failed to generate act artifacts for Fallback: %s", number, act_err)
 
@@ -1736,11 +1727,18 @@ def _handle_decision_tag(
                 cwd=str(base_work_dir), check=False, capture_output=True, timeout=30,
             )
             log.info("Issue #%d: fallback — reverted to %s, deleted %s", number, base_branch, branch)
-            _gh.add_comment(
-                owner, repo, number,
-                f"{head_text}**Fallback** — reverted to `{base_branch}` and deleted `{branch}`.\n"
-                f"Act artifact `Decision.md` generated in `docs/{number}-{slugify(issue.get('title', ''))}/act/`.",
-            )
+            if act_push_ok:
+                _gh.add_comment(
+                    owner, repo, number,
+                    f"{head_text}**Fallback** — reverted to `{base_branch}` and deleted `{branch}`.\n"
+                    f"Act artifact `Decision.md` generated in `docs/{number}-{slugify(issue.get('title', ''))}/act/`.",
+                )
+            else:
+                _gh.add_comment(
+                    owner, repo, number,
+                    f"{head_text}**Fallback** — reverted to `{base_branch}` and deleted `{branch}`.\n"
+                    f"Warning: act artifacts could not be generated or pushed (see logs).",
+                )
         except Exception as e:
             log.error("Issue #%d: fallback failed — %s", number, e)
             _gh.add_comment(
@@ -1777,8 +1775,6 @@ def ensure_pdca_branch(
     """
     branch = f"pdca/{issue_number}-{slugify(title)}"
     state["pdca_branch"] = branch
-    state["last_check"] = datetime.now(timezone.utc).isoformat()
-    save_state(state_dir, issue_number, state)
 
     try:
         # Check if branch exists locally
@@ -1814,6 +1810,15 @@ def ensure_pdca_branch(
             if checkout.returncode != 0:
                 stderr = checkout.stderr.strip()
                 log.error("Failed to checkout branch %s: %s", branch, stderr[:200])
+                # Pop the stash before returning so we don't orphan it
+                if _stashed:
+                    try:
+                        subprocess.run(
+                            ["git", "stash", "pop"],
+                            cwd=str(repo_root), capture_output=True, timeout=30,
+                        )
+                    except Exception:
+                        pass
                 return None
 
             if _stashed:
@@ -1911,7 +1916,7 @@ def process_issue(
         _mt.ensure_issue(number, issue.get("title", ""))
 
     # 新 Issue: 没有 PDCA 状态 → 确保全新会话
-    is_new_issue = state.get("status") is None and not state.get("completed_steps")
+    is_new_issue = state.get("last_check") is None and not state.get("completed_steps")
     if is_new_issue:
         log.info("Issue #%d: new issue detected, ensuring fresh session", number)
         reset_session(number, base_work_dir, state_dir)
@@ -2224,7 +2229,7 @@ def process_issue(
         decision_in_new = any(t in new_tags for t in ("#deploy", "#fix", "#fallback"))
         if decision_in_new:
             log.info("Issue #%d: post-completion decision tag in new comment — processing", number)
-            if _handle_decision_tag(state, tags, issue, owner, repo, number, state_dir, base_work_dir):
+            if _handle_decision_tag(state, new_tags, issue, owner, repo, number, state_dir, base_work_dir):
                 return
             # Tag exists but handler couldn't process it — still update last_check
             state["last_check"] = datetime.now(timezone.utc).isoformat()
@@ -2306,28 +2311,8 @@ def process_issue(
     # ── Execute step ─────────────────────────────────────────────────────
     title = issue["title"]
     step_dir = step_output_dir(base_work_dir, number, title, step_to_execute)
-    step_dir.mkdir(parents=True, exist_ok=True)
 
     if auto_run:
-        # Skip the context-hash check when refresh=True because the user
-        # explicitly wants a re-run (e.g., #pdca-refresh).  The hash will
-        # differ due to the new comment, but we still want to execute.
-        if not refresh:
-            # Check if we can skip AI execution (no context changes, files exist)
-            skip_ai, skip_reason = should_skip_ai_execution(
-                state, step_dir, step_to_execute, issue, comments
-            )
-            if skip_ai:
-                log.info(
-                    "Issue #%d: skipping %s — %s",
-                    number,
-                    SKILL_NAMES[step_to_execute],
-                    skip_reason,
-                )
-                state["last_check"] = datetime.now(timezone.utc).isoformat()
-                save_state(state_dir, number, state)
-                return
-
         skill = SKILL_NAMES[step_to_execute]
         log.info(
             "Issue #%d: running %s → %s",
@@ -2349,6 +2334,25 @@ def process_issue(
         # Re-create step_dir after git checkout — the branch switch may have
         # removed it if the directory didn't exist on the target branch.
         step_dir.mkdir(parents=True, exist_ok=True)
+
+        # Skip the context-hash check when refresh=True because the user
+        # explicitly wants a re-run (e.g., #pdca-refresh).  The hash will
+        # differ due to the new comment, but we still want to execute.
+        if not refresh:
+            # Check if we can skip AI execution (context unchanged, files exist on the correct branch)
+            skip_ai, skip_reason = should_skip_ai_execution(
+                state, step_dir, step_to_execute, issue, comments
+            )
+            if skip_ai:
+                log.info(
+                    "Issue #%d: skipping %s — %s",
+                    number,
+                    skill,
+                    skip_reason,
+                )
+                state["last_check"] = datetime.now(timezone.utc).isoformat()
+                save_state(state_dir, number, state)
+                return
 
         # Build consolidated context with emphasis on new comments.
         # On refresh, always pass ALL comments (including the user's feedback
@@ -2733,7 +2737,7 @@ def main() -> None:
     parser.add_argument(
         "--use-session",
         action="store_true",
-        default=True,
+        default=None,
         help="Use stateful Claude sessions (default: True)",
     )
     parser.add_argument(
@@ -2816,7 +2820,7 @@ def main() -> None:
         )
 
     # 确定是否使用会话模式
-    use_session = args.use_session and not args.no_session
+    use_session = (args.use_session if args.use_session is not None else True) and not args.no_session
     log.info(
         "PDClaw started (interval=%ds, auto_run=%s, work_dir=%s, "
         "state_dir=%s, memory_dir=%s, metrics_dir=%s, "
