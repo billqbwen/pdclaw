@@ -123,9 +123,8 @@ Issue #pdca-start
                               #pdca-close                        │
 
   注意：在正常流程中，Act 步骤被决策阶段
-  (#Deploy / #Fix / #Fallback) 替代。#act-approved 标签和
-  pdca-act 技能仅在需要显式 Act 执行的场景中存在，
-  实际使用中较为少见。
+  (#Deploy / #Fix / #Fallback) 替代。pdca-act 技能文件
+  仍然保留可用于手动执行，但实际使用中较为少见。
 ```
 
 ---
@@ -172,10 +171,9 @@ python pdclaw.py --issue https://github.com/owner/repo/issues/42 --once --auto-r
 | `#pdca-start` | **Plan** | `pdca-plan` | `Design.md`、`Impact.md` |
 | `#plan-approved` | **Do** | `pdca-do` | `Change.md` |
 | `#do-approved` | **Check** | `pdca-check` | `Review.md`、`Test.md` |
-| `#check-approved` | **Check** | `pdca-check` | 运行 Check，然后进入决策阶段 |
-| `#act-approved` | **Act** | `pdca-act` | `Decision.md`（较少使用 — 通常由决策阶段替代） |
+| `#check-approved` | **决策** | — | 确认 Check 输出，进入决策阶段 |
 
-> **为什么 Act 较少使用？** Check 步骤成功后，PDClaw 进入*决策阶段*，要求你选择 `#Deploy`、`#Fix` 或 `#Fallback`。这个人工决策在正常流程中替代了自动化的 Act 步骤。`#act-approved` 标签和 `pdca-act` 技能仅为向后兼容和需要显式 Act 执行的边缘场景而保留。
+> **为什么没有 Act 步骤的标签？** Check 成功后，PDClaw 进入*决策阶段*，要求你选择 `#Deploy`、`#Fix` 或 `#Fallback`。这个人工决策替代了自动化的 Act 步骤。`pdca-act` 技能文件仍然保留，可用于手动执行或边缘场景。
 
 ### 决策阶段标签
 
@@ -330,9 +328,12 @@ pdca/42-add-payment-gateway/
         │   └── Impact.md
         ├── do/
         │   └── Change.md
-        └── check/
-            ├── Review.md
-            └── Test.md
+        ├── check/
+        │   ├── Review.md
+        │   └── Test.md
+        └── act/
+            ├── Decision.md
+            └── CodeDiff.md    (仅 Deploy)
 ```
 
 - PDClaw 从部署分支自动创建分支

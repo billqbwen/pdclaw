@@ -122,9 +122,8 @@ Issue #pdca-start
                               #pdca-close                        │
 
   Note: In normal flow, the Act step is replaced by the Decision
-  Phase (#Deploy / #Fix / #Fallback). The #act-approved tag and
-  pdca-act skill exist for scenarios where explicit Act execution
-  is needed, but they are rarely used in practice.
+  Phase (#Deploy / #Fix / #Fallback). The pdca-act skill file
+  still exists for manual execution but is rarely used.
 ```
 
 ---
@@ -171,10 +170,9 @@ Add these tags as comments on a GitHub issue. PDClaw detects them and advances t
 | `#pdca-start` | **Plan** | `pdca-plan` | `Design.md`, `Impact.md` |
 | `#plan-approved` | **Do** | `pdca-do` | `Change.md` |
 | `#do-approved` | **Check** | `pdca-check` | `Review.md`, `Test.md` |
-| `#check-approved` | **Check** | `pdca-check` | Runs Check, then enters decision phase |
-| `#act-approved` | **Act** | `pdca-act` | `Decision.md`, `CodeDiff.md` (rarely used — decision phase replaces this) |
+| `#check-approved` | **Decision** | — | Confirm Check output, enter decision phase |
 
-> **Why is Act rarely used?** After the Check step succeeds, PDClaw enters a *decision phase* that asks you to choose `#Deploy`, `#Fix`, or `#Fallback`. This manual decision replaces the automated Act step in normal flow. The `#act-approved` tag and `pdca-act` skill exist for backward compatibility and edge cases where explicit Act execution is desired.
+> **Why is there no Act step tag?** After Check succeeds, PDClaw enters a *decision phase* that asks you to choose `#Deploy`, `#Fix`, or `#Fallback`. This manual decision replaces the automated Act step. The `pdca-act` skill file still exists for manual execution or edge cases.
 
 ### Decision Phase Tags
 
