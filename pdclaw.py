@@ -43,6 +43,7 @@ import signal
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -745,6 +746,21 @@ def _inject_memory_into_skill(skill_content: str, issue_number: int) -> str:
     return skill_content
 
 
+def _record_ai_call(issue_number: int, step: str, success: bool,
+                    elapsed_sec: float, output_chars: int) -> None:
+    """Record AI call metrics safely (metrics collector may be None)."""
+    _mt = get_metrics()
+    if _mt:
+        _mt.record_ai_call(
+            issue_number=issue_number,
+            step=step,
+            success=success,
+            elapsed_sec=elapsed_sec,
+            model=CLAUDE_MODEL,
+            output_chars=output_chars,
+        )
+
+
 def run_skill(
     skill_name: str,
     issue: dict,
@@ -824,16 +840,7 @@ def run_skill(
                      success, elapsed, output_len)
 
             # Record AI call metrics
-            _mt = get_metrics()
-            if _mt:
-                _mt.record_ai_call(
-                    issue_number=issue_number,
-                    step=step_name,
-                    success=success,
-                    elapsed_sec=elapsed,
-                    model=CLAUDE_MODEL,
-                    output_chars=output_len,
-                )
+            _record_ai_call(issue_number, step_name, success, elapsed, output_len)
 
             # 同时保存到 conversation log（向后兼容）
             if conv_path:
@@ -860,16 +867,8 @@ def run_skill(
         except Exception as e:
             log.error("Session execution failed: %s", e)
             # Record failed AI call
-            _mt2 = get_metrics()
-            if _mt2:
-                _mt2.record_ai_call(
-                    issue_number=issue_number,
-                    step=step_name,
-                    success=False,
-                    elapsed_sec=time.time() - t0 if 't0' in dir() else 0,
-                    model=CLAUDE_MODEL,
-                    output_chars=0,
-                )
+            _elapsed = time.time() - t0 if 't0' in dir() else 0
+            _record_ai_call(issue_number, step_name, False, _elapsed, 0)
             # 失败时回退到 stateless 模式
             log.info("Falling back to stateless mode")
             use_session = False
@@ -906,16 +905,7 @@ def run_skill(
                  result.returncode, elapsed, output_len)
 
         # Record AI call metrics
-        _mt3 = get_metrics()
-        if _mt3:
-            _mt3.record_ai_call(
-                issue_number=issue_number,
-                step=step_name,
-                success=(result.returncode == 0),
-                elapsed_sec=elapsed,
-                model=CLAUDE_MODEL,
-                output_chars=output_len,
-            )
+        _record_ai_call(issue_number, step_name, result.returncode == 0, elapsed, output_len)
 
         # Save the conversation turn regardless of outcome
         if conv_path:
@@ -942,16 +932,7 @@ def run_skill(
 
     except subprocess.TimeoutExpired:
         log.error("Skill %s timed out after %ds", skill_name, timeout)
-        _mt4 = get_metrics()
-        if _mt4:
-            _mt4.record_ai_call(
-                issue_number=issue_number,
-                step=step_name,
-                success=False,
-                elapsed_sec=timeout,
-                model=CLAUDE_MODEL,
-                output_chars=0,
-            )
+        _record_ai_call(issue_number, step_name, False, timeout, 0)
         if conv_path:
             turn = json.dumps({
                 "prompt": prompt,
@@ -1040,6 +1021,96 @@ def _verify_push_landed(repo_root: Path) -> bool:
         return True  # can't verify but don't block
 
 
+def _git_push_with_retry(repo_root: Path, push_args: list[str] | None = None) -> bool:
+    """Push current branch with retry for transient failures.
+
+    Handles "no upstream" errors with automatic -u origin HEAD fallback.
+    Verifies push landed on the remote after each attempt.
+    Returns True if push succeeded and was verified.
+    """
+    cmd = ["git", "push"]
+    if push_args:
+        cmd.extend(push_args)
+
+    for attempt in range(1, 4):
+        try:
+            subprocess.run(
+                cmd,
+                cwd=str(repo_root),
+                check=True,
+                capture_output=True,
+                timeout=120,
+                env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+                stdin=subprocess.DEVNULL,
+            )
+            if _verify_push_landed(repo_root):
+                return True
+            log.warning("Push verification failed (attempt %d/3)", attempt)
+        except subprocess.TimeoutExpired:
+            log.warning("git push timed out (attempt %d/3)", attempt)
+        except subprocess.CalledProcessError as e:
+            stderr = e.stderr.decode() if isinstance(e.stderr, bytes) else str(e.stderr or "")
+            if "no upstream" in stderr or "no such branch" in stderr:
+                try:
+                    subprocess.run(
+                        ["git", "push", "-u", "origin", "HEAD"],
+                        cwd=str(repo_root),
+                        check=True,
+                        capture_output=True,
+                        timeout=120,
+                        env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+                        stdin=subprocess.DEVNULL,
+                    )
+                    if _verify_push_landed(repo_root):
+                        return True
+                    log.warning("Push -u verification failed (attempt %d/3)", attempt)
+                except subprocess.TimeoutExpired:
+                    log.warning("git push -u timed out (attempt %d/3)", attempt)
+                except subprocess.CalledProcessError as e2:
+                    s2 = e2.stderr.decode() if isinstance(e2.stderr, bytes) else str(e2.stderr or "")
+                    log.warning("git push -u failed (attempt %d/3): %s", attempt, s2[:200])
+            else:
+                log.warning("git push failed (attempt %d/3): %s", attempt, stderr[:200])
+
+        if attempt < 3:
+            delay = attempt * 10
+            log.info("Retrying git push in %ds...", delay)
+            time.sleep(delay)
+
+    return False
+
+
+@contextmanager
+def stash_context(repo_root: Path, label: str = "pdca-stash"):
+    """Context manager that stashes dirty changes on enter and pops on exit.
+
+    Only stashes if the working tree is actually dirty.  Always pops the
+    stash on exit, even if the body raised an exception.
+    """
+    stashed = False
+    try:
+        status = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=str(repo_root), capture_output=True, text=True, timeout=10,
+        )
+        if status.stdout.strip():
+            subprocess.run(
+                ["git", "stash", "push", "--include-untracked", "-m", label],
+                cwd=str(repo_root), capture_output=True, timeout=30,
+            )
+            stashed = True
+        yield
+    finally:
+        if stashed:
+            try:
+                subprocess.run(
+                    ["git", "stash", "pop"],
+                    cwd=str(repo_root), capture_output=True, timeout=30,
+                )
+            except Exception:
+                pass
+
+
 def git_commit_and_push(files: list[Path], message: str, repo_root: Path) -> bool:
     """Stage, commit, and push generated files. Returns True on full success."""
     # Stage the step output files
@@ -1080,61 +1151,8 @@ def git_commit_and_push(files: list[Path], message: str, repo_root: Path) -> boo
         return False
 
     # Push — with retry for transient network failures
-    max_retries = 3
-    push_succeeded = False
-    for attempt in range(1, max_retries + 1):
-        try:
-            subprocess.run(
-                ["git", "push"],
-                cwd=str(repo_root),
-                check=True,
-                capture_output=True,
-                timeout=120,
-                env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
-                stdin=subprocess.DEVNULL,
-            )
-            push_succeeded = True
-            break
-        except subprocess.TimeoutExpired:
-            log.warning("git push timed out after 120s (attempt %d/%d)", attempt, max_retries)
-        except subprocess.CalledProcessError as e:
-            stderr = e.stderr.decode() if isinstance(e.stderr, bytes) else str(e.stderr or "")
-            # New branch needs upstream set
-            if "no upstream" in stderr or "no such branch" in stderr:
-                try:
-                    subprocess.run(
-                        ["git", "push", "-u", "origin", "HEAD"],
-                        cwd=str(repo_root),
-                        check=True,
-                        capture_output=True,
-                        timeout=120,
-                        env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
-                        stdin=subprocess.DEVNULL,
-                    )
-                    push_succeeded = True
-                    break
-                except subprocess.TimeoutExpired:
-                    log.warning("git push -u timed out after 120s (attempt %d/%d)", attempt, max_retries)
-                except subprocess.CalledProcessError as e2:
-                    s2 = e2.stderr.decode() if isinstance(e2.stderr, bytes) else str(e2.stderr or "")
-                    log.warning("git push -u failed (attempt %d/%d): %s", attempt, max_retries, s2[:200])
-            else:
-                log.warning("git push failed (attempt %d/%d): %s", attempt, max_retries, stderr[:200])
-
-        if attempt < max_retries:
-            delay = attempt * 10
-            log.info("Retrying git push in %ds...", delay)
-            time.sleep(delay)
-
-    if not push_succeeded:
-        log.warning("git push failed after %d attempts — files committed locally but not pushed", max_retries)
-        return False
-
-    # Post-push verification: fetch and compare local vs remote HEAD to
-    # ensure the push actually landed on the remote.  This catches edge
-    # cases where `git push` exits 0 but the commit never reaches the
-    # remote (e.g. pre-receive hook rejection, network truncation).
-    if not _verify_push_landed(repo_root):
+    if not _git_push_with_retry(repo_root):
+        log.warning("git push failed after 3 attempts — files committed locally but not pushed")
         return False
 
     log.info("Git push successful")
@@ -1463,27 +1481,12 @@ def _commit_act_artifacts(
         )
 
         # Push
-        for attempt in range(1, 4):
-            try:
-                subprocess.run(
-                    ["git", "push", "-u", "origin", "HEAD"],
-                    cwd=str(base_work_dir), check=True, capture_output=True,
-                    timeout=120,
-                    env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
-                    stdin=subprocess.DEVNULL,
-                )
-                log.info("Issue #%d: act artifacts pushed to %s", number, branch)
-                return True
-            except subprocess.TimeoutExpired:
-                log.warning("Issue #%d: act push timed out (attempt %d/3)", number, attempt)
-            except subprocess.CalledProcessError as e:
-                stderr = e.stderr.decode() if isinstance(e.stderr, bytes) else str(e.stderr or "")
-                log.warning("Issue #%d: act push failed (attempt %d/3): %s", number, attempt, stderr[:200])
-            if attempt < 3:
-                time.sleep(attempt * 10)
+        if not _git_push_with_retry(base_work_dir, ["-u", "origin", "HEAD"]):
+            log.warning("Issue #%d: act push failed after 3 attempts — commit exists locally but not on remote", number)
+            return False
 
-        log.warning("Issue #%d: act push failed after 3 attempts — commit exists locally but not on remote", number)
-        return False
+        log.info("Issue #%d: act artifacts pushed to %s", number, branch)
+        return True
     except Exception as e:
         log.error("Issue #%d: failed to commit act artifacts: %s", number, e)
         return False
@@ -1516,83 +1519,43 @@ def _handle_decision_tag(
             log.info("Issue #%d: deploy already merged locally, push pending — skipping re-merge", number)
             return True
 
-        # Detect uncommitted changes that would block git checkout
-        _dirty = False
-        _stashed = False
+        # Detect uncommitted changes and stash them for the duration of deploy
         deploy_failed = False
+        act_artifacts_ok = True
+
         try:
-            status = subprocess.run(
-                ["git", "status", "--porcelain"],
-                cwd=str(base_work_dir), capture_output=True, text=True, timeout=10,
-            )
-            _dirty = bool(status.stdout.strip())
-
-            if _dirty:
-                subprocess.run(
-                    ["git", "stash", "push", "--include-untracked", "-m", "pdca-deploy-stash"],
-                    cwd=str(base_work_dir), capture_output=True, timeout=30,
+            with stash_context(base_work_dir, "pdca-deploy-stash"):
+                # Try checking out the target branch; create from base/main if missing
+                checkout = subprocess.run(
+                    ["git", "checkout", target],
+                    cwd=str(base_work_dir), capture_output=True, text=True,
                 )
-                _stashed = True
-
-            # Try checking out the target branch; create from base/main if missing
-            checkout = subprocess.run(
-                ["git", "checkout", target],
-                cwd=str(base_work_dir), capture_output=True, text=True,
-            )
-            if checkout.returncode != 0:
-                base = state.get("base_branch", DEPLOY_BRANCH)
-                log.info("Deploy: target '%s' not found, creating from '%s'", target, base)
-                subprocess.run(
-                    ["git", "checkout", "-b", target, base],
-                    cwd=str(base_work_dir), check=True, capture_output=True,
-                )
-            subprocess.run(
-                ["git", "merge", branch, "--no-edit"],
-                cwd=str(base_work_dir), check=True, capture_output=True, timeout=30,
-            )
-
-            # Push with retry for transient network failures
-            push_succeeded = False
-            for attempt in range(1, 4):
-                try:
+                if checkout.returncode != 0:
+                    base = state.get("base_branch", DEPLOY_BRANCH)
+                    log.info("Deploy: target '%s' not found, creating from '%s'", target, base)
                     subprocess.run(
-                        ["git", "push", "-u", "origin", "HEAD"],
-                        cwd=str(base_work_dir),
-                        check=True,
-                        capture_output=True,
-                        timeout=120,
-                        env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
-                        stdin=subprocess.DEVNULL,
+                        ["git", "checkout", "-b", target, base],
+                        cwd=str(base_work_dir), check=True, capture_output=True,
                     )
-                    push_succeeded = True
-                    break
-                except subprocess.TimeoutExpired:
-                    log.warning("Deploy git push timed out (attempt %d/3)", attempt)
-                except subprocess.CalledProcessError as e:
-                    stderr = e.stderr.decode() if isinstance(e.stderr, bytes) else str(e.stderr or "")
-                    log.warning("Deploy git push failed (attempt %d/3): %s", attempt, stderr[:200])
-                if attempt < 3:
-                    time.sleep(attempt * 10)
-
-            if not push_succeeded:
-                raise RuntimeError("git push failed after 3 attempts — network connectivity issue")
-
-            log.info("Issue #%d: deployed — merged %s into %s", number, branch, target)
-
-            # Return to the pdca branch and restore work-in-progress
-            subprocess.run(
-                ["git", "checkout", branch],
-                cwd=str(base_work_dir), capture_output=True, timeout=30,
-            )
-            if _stashed:
                 subprocess.run(
-                    ["git", "stash", "pop"],
+                    ["git", "merge", branch, "--no-edit"],
+                    cwd=str(base_work_dir), check=True, capture_output=True, timeout=30,
+                )
+
+                # Push with retry for transient network failures
+                if not _git_push_with_retry(base_work_dir, ["-u", "origin", "HEAD"]):
+                    raise RuntimeError("git push failed after 3 attempts — network connectivity issue")
+
+                log.info("Issue #%d: deployed — merged %s into %s", number, branch, target)
+
+                # Return to the pdca branch before stash pop
+                subprocess.run(
+                    ["git", "checkout", branch],
                     cwd=str(base_work_dir), capture_output=True, timeout=30,
                 )
 
-            # Generate Act artifacts (Decision.md + CodeDiff.md) and push
-            # to the PDCA branch before updating state
-            act_artifacts_ok = True
+            # stash is popped — Generate Act artifacts (Decision.md + CodeDiff.md)
+            # and push to the PDCA branch before updating state.
             try:
                 act_artifacts_ok = _generate_act_artifacts(
                     state, "Deploy", issue, owner, repo, number,
@@ -1617,17 +1580,12 @@ def _handle_decision_tag(
                 )
         except Exception as e:
             log.error("Issue #%d: deploy failed — %s", number, e)
-            # Try to recover: switch back to the PDCA branch
+            # Try to recover: switch back to the PDCA branch (stash already popped)
             try:
                 subprocess.run(
                     ["git", "checkout", branch],
                     cwd=str(base_work_dir), capture_output=True, timeout=30,
                 )
-                if _stashed:
-                    subprocess.run(
-                        ["git", "stash", "pop"],
-                        cwd=str(base_work_dir), capture_output=True, timeout=30,
-                    )
             except Exception:
                 pass
             deploy_failed = True
@@ -1783,52 +1741,17 @@ def ensure_pdca_branch(
             cwd=str(repo_root), capture_output=True, text=True,
         )
         if result.returncode == 0:
-            # Stash any dirty changes before checkout to avoid "Please commit
-            # your changes or stash them" errors that get swallowed by
-            # capture_output.  The stash is popped after checkout.
-            _stashed = False
-            try:
-                status = subprocess.run(
-                    ["git", "status", "--porcelain"],
-                    cwd=str(repo_root), capture_output=True, text=True, timeout=10,
+            # Stash any dirty changes before checkout, pop after checkout.
+            # The stash context manager handles both success and error paths.
+            with stash_context(repo_root, f"pdca-auto-stash-{branch}"):
+                checkout = subprocess.run(
+                    ["git", "checkout", branch],
+                    cwd=str(repo_root), capture_output=True, text=True,
                 )
-                if status.stdout.strip():
-                    subprocess.run(
-                        ["git", "stash", "push", "--include-untracked",
-                         "-m", f"pdca-auto-stash-{branch}"],
-                        cwd=str(repo_root), capture_output=True, timeout=30,
-                    )
-                    _stashed = True
-                    log.info("Stashed dirty changes before checkout of %s", branch)
-            except Exception:
-                pass
-
-            checkout = subprocess.run(
-                ["git", "checkout", branch],
-                cwd=str(repo_root), capture_output=True, text=True,
-            )
-            if checkout.returncode != 0:
-                stderr = checkout.stderr.strip()
-                log.error("Failed to checkout branch %s: %s", branch, stderr[:200])
-                # Pop the stash before returning so we don't orphan it
-                if _stashed:
-                    try:
-                        subprocess.run(
-                            ["git", "stash", "pop"],
-                            cwd=str(repo_root), capture_output=True, timeout=30,
-                        )
-                    except Exception:
-                        pass
-                return None
-
-            if _stashed:
-                try:
-                    subprocess.run(
-                        ["git", "stash", "pop"],
-                        cwd=str(repo_root), capture_output=True, timeout=30,
-                    )
-                except Exception:
-                    pass
+                if checkout.returncode != 0:
+                    stderr = checkout.stderr.strip()
+                    log.error("Failed to checkout branch %s: %s", branch, stderr[:200])
+                    return None
 
             log.info("Reusing existing branch: %s", branch)
             return branch
@@ -1884,205 +1807,147 @@ def ensure_pdca_branch(
         return None
 
 
-def process_issue(
+def _retry_pending_push(
+    state: dict,
     owner: str,
     repo: str,
     number: int,
-    state_dir: Path,
     base_work_dir: Path,
-    auto_run: bool,
-    use_session: bool = True,
-) -> None:
-    """Evaluate and act on a single issue's PDCA state."""
-    try:
-        issue = _gh.get_issue(owner, repo, number)
-    except requests.RequestException as e:
-        log.warning("Cannot fetch issue #%d: %s", number, e)
-        return
+    state_dir: Path,
+    issue: dict,
+) -> bool:
+    """Retry a pending git push from a previous cycle.
 
-    # Fetch comments — tags are only read from comments, not issue body
-    try:
-        comments = _gh.get_issue_comments(owner, repo, number)
-    except requests.RequestException:
-        comments = []
+    Returns True if the push was handled and the caller should return
+    (push failed definitively), or False if there was no pending push
+    or the push succeeded (caller should continue processing).
+    """
+    if not state.get("push_pending"):
+        return False
 
-    state = load_state(state_dir, number)
-    log.info("[Poll] Issue #%d — state: current_step=%s, completed=%s, status=%s",
-             number, state.get("current_step"), state.get("completed_steps"), state.get("status"))
+    push_pending_type = state.get("push_pending_type", "step")
+    log.info("Issue #%d: retrying pending git push (type=%s)", number, push_pending_type)
 
-    # Track issue in metrics
-    _mt = get_metrics()
-    if _mt:
-        _mt.ensure_issue(number, issue.get("title", ""))
+    push_retry_ok = False
 
-    # 新 Issue: 没有 PDCA 状态 → 确保全新会话
-    is_new_issue = state.get("last_check") is None and not state.get("completed_steps")
-    if is_new_issue:
-        log.info("Issue #%d: new issue detected, ensuring fresh session", number)
-        reset_session(number, base_work_dir, state_dir)
-
-    # Retry pending push from a previous cycle (e.g. transient network failure)
-    if state.get("push_pending"):
-        log.info("Issue #%d: retrying pending git push (type=%s)", number, state.get("push_pending_type", "step"))
-        pdca_branch = state.get("pdca_branch") or f"pdca/{number}-{slugify(issue.get('title', ''))}"
-        push_retry_ok = False
-
-        # For deploy push retry, we may need to switch to the target branch first
-        # since the merge was already committed locally on the target branch.
-        # If the working tree is dirty (uncommitted changes from other issues),
-        # stash before checkout and pop after push, mirroring the deploy handler.
-        push_pending_type = state.get("push_pending_type", "step")
-        _retry_stashed = False
+    if push_pending_type == "deploy":
+        target = DEPLOY_BRANCH
         _retry_original_branch = None
-        if push_pending_type == "deploy":
-            target = DEPLOY_BRANCH
-            log.info("Issue #%d: deploy push retry — ensuring we're on branch '%s'", number, target)
+        try:
+            rev = subprocess.run(
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                cwd=str(base_work_dir), capture_output=True, text=True, timeout=10,
+            )
+            _retry_original_branch = rev.stdout.strip() if rev.returncode == 0 else None
+        except Exception:
+            pass
+
+        with stash_context(base_work_dir, "pdca-push-retry-stash"):
             try:
-                # Remember the current branch so we can return to it
-                rev = subprocess.run(
-                    ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-                    cwd=str(base_work_dir), capture_output=True, text=True, timeout=10,
-                )
-                _retry_original_branch = rev.stdout.strip() if rev.returncode == 0 else None
-
-                # Stash dirty changes if any (same as deploy handler)
-                status = subprocess.run(
-                    ["git", "status", "--porcelain"],
-                    cwd=str(base_work_dir), capture_output=True, text=True, timeout=10,
-                )
-                if status.stdout.strip():
-                    subprocess.run(
-                        ["git", "stash", "push", "--include-untracked", "-m", "pdca-push-retry-stash"],
-                        cwd=str(base_work_dir), capture_output=True, timeout=30,
-                    )
-                    _retry_stashed = True
-
                 checkout = subprocess.run(
                     ["git", "checkout", target],
                     cwd=str(base_work_dir), capture_output=True, text=True, timeout=30,
                 )
                 if checkout.returncode != 0:
                     log.warning("Issue #%d: checkout to '%s' failed: %s", number, target, checkout.stderr.strip()[:200])
-                    # Can't push — restore and bail
-                    if _retry_stashed:
-                        subprocess.run(
-                            ["git", "stash", "pop"],
-                            cwd=str(base_work_dir), capture_output=True, timeout=30,
-                        )
                     _gh.add_comment(
                         owner, repo, number,
-                        f"**Deploy Push Retry Failed** — could not switch to `{target}` branch "
-                        f"(working directory may be dirty). Will retry on next poll cycle.",
+                        f"**Deploy Push Retry Failed** — could not switch to `{target}` branch. "
+                        f"Will retry on next poll cycle.",
                     )
                     state["last_check"] = datetime.now(timezone.utc).isoformat()
                     save_state(state_dir, number, state)
-                    return
-            except Exception as e:
-                log.warning("Issue #%d: could not checkout '%s' for deploy push retry: %s", number, target, e)
-                _gh.add_comment(
-                    owner, repo, number,
-                    f"**Deploy Push Retry Failed** — error switching to `{target}` branch: {e}. "
-                    f"Will retry on next poll cycle.",
-                )
-                state["last_check"] = datetime.now(timezone.utc).isoformat()
-                save_state(state_dir, number, state)
-                return
+                    return True
 
-        for attempt in range(1, 4):
-            try:
-                subprocess.run(
-                    ["git", "push"],
-                    cwd=str(base_work_dir),
-                    check=True,
-                    capture_output=True,
-                    timeout=120,
-                    env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
-                    stdin=subprocess.DEVNULL,
-                )
-                push_retry_ok = True
-                break
-            except subprocess.CalledProcessError as e:
-                stderr = e.stderr.decode() if isinstance(e.stderr, bytes) else str(e.stderr or "")
-                if "no upstream" in stderr or "no such branch" in stderr:
-                    try:
-                        subprocess.run(
-                            ["git", "push", "-u", "origin", "HEAD"],
-                            cwd=str(base_work_dir),
-                            check=True,
-                            capture_output=True,
-                            timeout=120,
-                            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
-                            stdin=subprocess.DEVNULL,
-                        )
-                        push_retry_ok = True
-                        break
-                    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e2:
-                        s2 = e2.stderr.decode() if isinstance(e2, subprocess.CalledProcessError) and isinstance(e2.stderr, bytes) else str(e2)
-                        log.warning("Issue #%d: pending push -u failed (attempt %d/3): %s", number, attempt, s2[:200] if isinstance(s2, str) else "")
-                else:
-                    log.warning("Issue #%d: pending push failed (attempt %d/3): %s", number, attempt, stderr[:200])
-            except subprocess.TimeoutExpired:
-                log.warning("Issue #%d: pending push timed out (attempt %d/3)", number, attempt)
+                push_retry_ok = _git_push_with_retry(base_work_dir)
 
-            if attempt < 3:
-                delay = attempt * 10
-                log.info("Retrying pending push in %ds...", delay)
-                time.sleep(delay)
-
-        if push_retry_ok:
-            # Verify the push actually landed on the remote
-            if not _verify_push_landed(base_work_dir):
-                push_retry_ok = False
-                log.warning("Issue #%d: pending push verification failed — will retry next cycle", number)
-
-        # Restore original branch and stashed changes after deploy push retry
-        if push_pending_type == "deploy":
-            try:
                 if _retry_original_branch:
                     subprocess.run(
                         ["git", "checkout", _retry_original_branch],
                         cwd=str(base_work_dir), capture_output=True, timeout=30,
                     )
-                if _retry_stashed:
-                    subprocess.run(
-                        ["git", "stash", "pop"],
-                        cwd=str(base_work_dir), capture_output=True, timeout=30,
-                    )
             except Exception:
-                pass
+                try:
+                    if _retry_original_branch:
+                        subprocess.run(
+                            ["git", "checkout", _retry_original_branch],
+                            cwd=str(base_work_dir), capture_output=True, timeout=30,
+                        )
+                except Exception:
+                    pass
+                raise
+    else:
+        push_retry_ok = _git_push_with_retry(base_work_dir)
 
-        if push_retry_ok:
-            log.info("Issue #%d: pending push succeeded", number)
-            # If this was a deploy retry, also mark act as completed now
-            if push_pending_type == "deploy":
-                if "act" not in state.get("completed_steps", []):
-                    state.setdefault("completed_steps", []).append("act")
-                state["current_step"] = "act"
-                state["phase"] = None
-                _mt_retry = get_metrics()
-                if _mt_retry:
-                    _mt_retry.mark_issue_done(number)
-            state.pop("push_pending", None)
-            state.pop("push_pending_type", None)
-            save_state(state_dir, number, state)
-        else:
-            # Still failing — wait for next cycle to retry.
-            # Post a comment so the user knows about the push issue.
-            target_branch = state.get("push_pending_type", "step")
-            if target_branch == "deploy":
-                target_branch = DEPLOY_BRANCH
-            _gh.add_comment(
-                owner, repo, number,
-                f"**Deploy Push Retry Failed**\n\n"
-                f"Git push to `{target_branch}` failed after 3 attempts — network connectivity issue "
-                f"(unable to reach GitHub). The merge is committed locally. "
-                f"Will retry push on the next poll cycle.",
-            )
-            state["last_check"] = datetime.now(timezone.utc).isoformat()
-            save_state(state_dir, number, state)
-            return
+    if push_retry_ok:
+        log.info("Issue #%d: pending push succeeded", number)
+        if push_pending_type == "deploy":
+            if "act" not in state.get("completed_steps", []):
+                state.setdefault("completed_steps", []).append("act")
+            state["current_step"] = "act"
+            state["phase"] = None
+            _mt_retry = get_metrics()
+            if _mt_retry:
+                _mt_retry.mark_issue_done(number)
+        state.pop("push_pending", None)
+        state.pop("push_pending_type", None)
+        save_state(state_dir, number, state)
+        return False  # push succeeded — caller may continue
+    else:
+        _gh.add_comment(
+            owner, repo, number,
+            f"**Deploy Push Retry Failed**\n\n"
+            f"Git push failed after 3 attempts — network connectivity issue. "
+            f"The merge is committed locally. Will retry on the next poll cycle.",
+        )
+        state["last_check"] = datetime.now(timezone.utc).isoformat()
+        save_state(state_dir, number, state)
+        return True  # caller should return
 
-    # Re-opened issue: GitHub is open but PDCA state says closed → resume
+def _detect_refresh(state: dict, tags: set[str], comments: list[dict], completed: list[str]) -> bool:
+    """Check if #pdca-refresh is present in new human comments.
+
+    Returns True only when a refresh was explicitly requested in a new
+    human comment and there is a step to refresh.
+    """
+    if "#pdca-refresh" not in tags:
+        return False
+    new_human, _ = get_new_human_comments(state, comments)
+    refresh_in_new = any(
+        "#pdca-refresh" in get_tags(c.get("body", ""))
+        for c in new_human
+    )
+    if not refresh_in_new:
+        return False
+    if not completed and not state.get("current_step"):
+        return False
+    return True
+
+
+def process_issue(
+    owner: str, repo: str, number: int,
+    state_dir: Path, base_work_dir: Path,
+    auto_run: bool, use_session: bool,
+) -> None:
+    """Process a single issue: detect activity, resolve next step, execute it."""
+    global _memory
+
+    issue = _gh.get_issue(owner, repo, number)
+    state = load_state(state_dir, number)
+    comments = _gh.get_issue_comments(owner, repo, number)
+
+    if _memory is not None:
+        _memory.issue_processed(number)
+
+    store_issue_snapshot(state, issue)
+
+    # ── Retry pending git push ──────────────────────────────────────────
+    if _retry_pending_push(state, owner, repo, number, base_work_dir, state_dir, issue):
+        return
+
+    _mt = get_metrics()
+
+    # ── Re-opened issue ─────────────────────────────────────────────────
     if issue["state"] == "open" and state.get("status") in ("closed", "aborted", "skipped"):
         log.info("Issue #%d: re-opened, resuming PDCA process", number)
         state["status"] = "active"
@@ -2101,89 +1966,23 @@ def process_issue(
         ctags = get_tags(body)
         if ctags:
             log.info("[Poll]   comment[%d] at %s by %s: tags=%s", i, c.get("created_at"), c.get("user", {}).get("login", "?"), ctags)
-        # Diagnostic: check for approval keywords even if regex didn't match
         for kw in ("do-approved", "check-approved", "act-approved"):
             if kw in body.lower() and f"#{kw}" not in ctags:
                 log.warning("[Poll]   comment[%d] contains '%s' but regex didn't match — raw snippet: %s",
                             i, kw, body[:300].replace("\n", "\\n"))
 
-    # #pdca-refresh: detect from comments.  We use three strategies:
-    #   1. New human comment with #pdca-refresh (standard path)
-    #   2. Any #pdca-refresh comment whose timestamp is newer than
-    #      last_check — catches the case where last_check was bumped
-    #      by a no-op cycle.
-    #   3. If #pdca-refresh is present but no approval tag can advance
-    #      the state, force refresh — the user's only intent is to
-    #      re-run the current step.
-    refresh = False
-    if "#pdca-refresh" in tags:
-        new_human, _ = get_new_human_comments(state, comments)
-        log.info("[Refresh] #pdca-refresh in tags — new_human_comments=%d", len(new_human))
-        refresh = any(
-            "#pdca-refresh" in get_tags(c.get("body", ""))
-            for c in new_human
-        )
-        # Fallback: check timestamps
-        if not refresh and state.get("last_check"):
-            last_check_ts = _parse_ts(state["last_check"])
-            for c in comments:
-                created_at = c.get("created_at", "")
-                if not created_at:
-                    continue
-                comment_ts = _parse_ts(created_at)
-                if comment_ts > last_check_ts and "#pdca-refresh" in get_tags(c.get("body", "")):
-                    refresh = True
-                    log.info("[Refresh] Found #pdca-refresh in comment at %s (after last_check %s)", created_at, state["last_check"])
-                    break
-        # Last resort: #pdca-refresh is present but strategies 1 & 2
-        # didn't match.  This can happen because last_check was bumped
-        # past the comment.  We force refresh ONLY if the approval chain
-        # also can't advance — i.e., the user's only actionable tag is
-        # #pdca-refresh.  If an approval tag can still drive a step
-        # transition, that takes priority and we don't force refresh.
-        # However, if all approval-driven steps are already completed,
-        # the #pdca-refresh is stale (it was consumed by a previous
-        # cycle) and we should NOT re-trigger it.
-        if not refresh:
-            approval_next = resolve_next_step(tags, completed)
-            if approval_next:
-                # An approval tag can advance — it will be handled in
-                # the main flow; no need to force refresh.
-                log.info("[Refresh] #pdca-refresh found in tags but approval tag will advance to '%s' (no force needed)", approval_next)
-            else:
-                # No approval can advance.  Check whether the
-                # #pdca-refresh comments are genuinely stale — i.e. they
-                # were all posted before the current step was last
-                # completed.  Use step_completed_at (when the AI
-                # actually finished generating files) rather than
-                # last_check (which is bumped on every poll) so that
-                # refresh comments posted between step completion and
-                # the next poll are not incorrectly marked stale.
-                all_refresh_ts = []
-                for c in comments:
-                    if "#pdca-refresh" in get_tags(c.get("body", "")):
-                        ts = _parse_ts(c.get("created_at", ""))
-                        if ts:
-                            all_refresh_ts.append(ts)
-                step_done_at = state.get("step_completed_at")
-                step_done_ts = _parse_ts(step_done_at) if step_done_at else None
-                if all_refresh_ts and step_done_ts and max(all_refresh_ts) < step_done_ts:
-                    log.info("[Refresh] #pdca-refresh comments are all older than step_completed_at — stale, not forcing")
-                else:
-                    refresh = True
-                    log.info("[Refresh] #pdca-refresh in tags, no approval can advance, and refresh is recent — forcing refresh")
+    # ── #pdca-refresh detection ───────────────────────────────────────────────
+    refresh = _detect_refresh(state, tags, comments, completed)
+    if refresh:
+        log.info("[Refresh] Refresh triggered for issue #%d", number)
 
     # ── Lifecycle tags ───────────────────────────────────────────────────
     if _handle_lifecycle_tags(state, tags, issue, owner, repo, number, state_dir, base_work_dir, comments):
         return
 
     # ── Check-review phase ───────────────────────────────────────────────
-    # After Check completes, the runner waits for #check-approved before
-    # entering the decision phase.  This ensures the user has reviewed the
-    # Check output (Review.md, Test.md) and explicitly confirmed it.
     if state.get("phase") == "check-review":
         if "#check-approved" in tags:
-            # User confirmed the Check output — transition to decision phase
             state["phase"] = "decision"
             state["last_check"] = datetime.now(timezone.utc).isoformat()
             save_state(state_dir, number, state)
@@ -2197,30 +1996,21 @@ def process_issue(
             )
             log.info("Issue #%d: Check approved, entered decision phase", number)
             return
-        # No #check-approved yet — wait for user input
         state["last_check"] = datetime.now(timezone.utc).isoformat()
         save_state(state_dir, number, state)
         log.info("Issue #%d: awaiting #check-approved (phase=check-review)", number)
         return
 
     # ── Decision phase ───────────────────────────────────────────────────
-    # After #check-approved is received, the runner asks for a deployment
-    # decision.  Decision tags (#deploy, #fix, #fallback) are handled here,
-    # before step resolution, so they short-circuit the normal approval chain.
     if state.get("phase") == "decision":
         if _handle_decision_tag(state, tags, issue, owner, repo, number, state_dir, base_work_dir):
             return
-        # No valid decision tag yet — wait for user input
         state["last_check"] = datetime.now(timezone.utc).isoformat()
         save_state(state_dir, number, state)
         log.info("Issue #%d: awaiting decision tag (Deploy / Fix / Fallback)", number)
         return
 
     # ── Fallback: decision tag after all steps completed ──────────────────
-    # If all PDCA steps are done but a decision tag (#Deploy/#Fix/#Fallback)
-    # appears in a new comment, process it directly.  This covers the case
-    # where the Act step ran before the decision phase was implemented
-    # (backward compatibility).
     if len(completed) >= len(PDCA_STEPS) and state.get("status") == "active":
         new_human, _ = get_new_human_comments(state, comments)
         new_tags = set()
@@ -2231,7 +2021,6 @@ def process_issue(
             log.info("Issue #%d: post-completion decision tag in new comment — processing", number)
             if _handle_decision_tag(state, new_tags, issue, owner, repo, number, state_dir, base_work_dir):
                 return
-            # Tag exists but handler couldn't process it — still update last_check
             state["last_check"] = datetime.now(timezone.utc).isoformat()
             save_state(state_dir, number, state)
             return
@@ -2242,33 +2031,20 @@ def process_issue(
     # ── Resolve which step to execute ────────────────────────────────────
     step_to_execute: str | None = None
 
-    # Approval tags take priority over #pdca-refresh: if the user wrote
-    # both #do-approved and #pdca-refresh in the same comment, the
-    # intention is to advance to the next step (check), not to re-run
-    # the current one.
     approval_step = resolve_next_step(tags, completed)
     if approval_step:
         step_to_execute = approval_step
         log.info("[Approval] Approval tag detected — overriding refresh, step=%s", step_to_execute)
     elif refresh:
-        # #pdca-refresh: re-execute the current step with new user input to
-        # refine the output.  "Current step" is simply state["current_step"],
-        # i.e. the step the issue is actually on.  If current_step is unset
-        # (brand-new issue), fall back to the first PDCA step.
         step_to_execute = state.get("current_step") or PDCA_STEPS[0]
         log.info("[Refresh] #pdca-refresh detected — current_step=%s, resolved to execute=%s",
                  state.get("current_step"), step_to_execute)
     else:
-        # Normal flow: follow the approval chain
         step_to_execute = resolve_next_step(tags, completed)
 
     log.info(
         "Issue #%-5d tags=%s to_execute=%s completed=%s status=%s",
-        number,
-        tags,
-        step_to_execute or "—",
-        completed,
-        state.get("status", "active"),
+        number, tags, step_to_execute or "—", completed, state.get("status", "active"),
     )
 
     if not step_to_execute:
@@ -2280,10 +2056,6 @@ def process_issue(
     # ── New-activity check ───────────────────────────────────────────────
     triggered, reason, new_comments = has_new_activity(state, issue, comments)
 
-    # Tags that drive a valid step transition count as activity even without
-    # new comments.  This covers the case where the user added a tag comment
-    # in a previous cycle but last_check was bumped past it (e.g. a no-op
-    # poll cycle ran in between).
     if not triggered:
         step_changed = step_to_execute is not None and step_to_execute != state.get("current_step")
         if refresh or step_changed:
@@ -2301,27 +2073,43 @@ def process_issue(
     log.info("Issue #%d: %s", number, reason)
     store_issue_snapshot(state, issue)
 
-    # Post a "processing" comment so the user knows the runner is working
-    step_label = step_to_execute.capitalize()
     _gh.add_comment(
         owner, repo, number,
-        f"⚙️ **{step_label}** step in progress — please wait...",
+        f"⚙️ **{step_to_execute.capitalize()}** step in progress — please wait...",
     )
 
     # ── Execute step ─────────────────────────────────────────────────────
+    _execute_step(state, step_to_execute, tags, refresh, issue, owner, repo, number,
+                  base_work_dir, state_dir, comments, auto_run, use_session, _mt,
+                  comment_text, new_comments)
+
+
+def _execute_step(
+    state: dict,
+    step_to_execute: str,
+    tags: set[str],
+    refresh: bool,
+    issue: dict,
+    owner: str,
+    repo: str,
+    number: int,
+    base_work_dir: Path,
+    state_dir: Path,
+    comments: list[dict],
+    auto_run: bool,
+    use_session: bool,
+    _mt,
+    comment_text: str,
+    new_comments: list[dict],
+) -> None:
+    """Execute a PDCA step: run AI skill, commit+publish, and post result comments."""
     title = issue["title"]
     step_dir = step_output_dir(base_work_dir, number, title, step_to_execute)
 
     if auto_run:
         skill = SKILL_NAMES[step_to_execute]
-        log.info(
-            "Issue #%d: running %s → %s",
-            number,
-            skill,
-            ", ".join(STEP_FILES[step_to_execute]),
-        )
+        log.info("Issue #%d: running %s → %s", number, skill, ", ".join(STEP_FILES[step_to_execute]))
 
-        # Create (Plan) or checkout (Do/Check/Act) the PDCA feature branch
         branch = ensure_pdca_branch(state, state_dir, number, title, base_work_dir)
         if not branch:
             log.error("Issue #%d: cannot proceed without PDCA branch", number)
@@ -2331,46 +2119,27 @@ def process_issue(
             )
             return
 
-        # Re-create step_dir after git checkout — the branch switch may have
-        # removed it if the directory didn't exist on the target branch.
         step_dir.mkdir(parents=True, exist_ok=True)
 
-        # Skip the context-hash check when refresh=True because the user
-        # explicitly wants a re-run (e.g., #pdca-refresh).  The hash will
-        # differ due to the new comment, but we still want to execute.
         if not refresh:
-            # Check if we can skip AI execution (context unchanged, files exist on the correct branch)
             skip_ai, skip_reason = should_skip_ai_execution(
                 state, step_dir, step_to_execute, issue, comments
             )
             if skip_ai:
-                log.info(
-                    "Issue #%d: skipping %s — %s",
-                    number,
-                    skill,
-                    skip_reason,
-                )
+                log.info("Issue #%d: skipping %s — %s", number, skill, skip_reason)
                 state["last_check"] = datetime.now(timezone.utc).isoformat()
                 save_state(state_dir, number, state)
                 return
 
-        # Build consolidated context with emphasis on new comments.
-        # On refresh, always pass ALL comments (including the user's feedback
-        # with answers to outstanding questions) so the AI can process them.
+        # Build consolidated context
         extra_context = ""
         if step_to_execute == "plan":
             if refresh:
-                # Refresh: delete existing step files so the AI is forced to
-                # regenerate them from scratch rather than reporting they are
-                # "up-to-date".  The user explicitly requested regeneration
-                # via #pdca-refresh.
                 for fname in STEP_FILES[step_to_execute]:
                     fp = step_dir / fname
                     if fp.exists():
                         fp.unlink()
                         log.info("[Refresh] Deleted %s to force regeneration", fp)
-                # Refresh: pass ALL comments as context so AI can process
-                # user feedback, answers to outstanding questions, etc.
                 all_comment_ids = {c.get("id") for c in comments if not _gh.is_pdca_runner_comment(c)}
                 extra_context = build_consolidated_context(issue, comments, all_comment_ids)
                 extra_context += (
@@ -2385,9 +2154,6 @@ def process_issue(
                 new_comment_ids = {c.get("id") for c in new_comments} if new_comments else set()
                 extra_context = build_consolidated_context(issue, comments, new_comment_ids)
 
-        # For non-Plan steps on refresh, also pass consolidated context
-        # so the AI can see user feedback, and delete existing files to
-        # force regeneration.
         if step_to_execute != "plan" and refresh:
             for fname in STEP_FILES[step_to_execute]:
                 fp = step_dir / fname
@@ -2406,23 +2172,12 @@ def process_issue(
             log.info("[Refresh] Passing %d human comments as context for %s regeneration",
                      len(all_comment_ids), step_to_execute)
 
-        # Determine working directory and output location
-        # Do runs from project root so it can modify code;
-        # other steps only generate docs so they run inside step_dir.
         if step_to_execute == "do":
             skill_cwd = base_work_dir
-            extra_context += (
-                f"\n\nPut Change.md into: {step_dir}"
-            )
+            extra_context += f"\n\nPut Change.md into: {step_dir}"
         else:
             skill_cwd = step_dir
 
-        # Conversation continuity — reuse the same Claude session across
-        # poll cycles for the same (issue, step) so the AI doesn't redo work.
-        # /new-refresh or #pdca-new-session force a fresh start.
-        # On #pdca-refresh, ALWAYS start a new session so the AI processes
-        # the user's feedback (answers to outstanding questions, etc.) with
-        # a clean context rather than being confused by old session history.
         new_session = (
             "#pdca-new-session" in tags
             or bool(NEW_SESSION_RE.search(comment_text))
@@ -2430,20 +2185,16 @@ def process_issue(
         )
         conv_path = _conv_path(state_dir, number, step_to_execute)
 
-        # 使用会话模式执行（同一 Issue 的步骤间保持上下文）
         ok, _ = run_skill(
             skill, issue, skill_cwd, state_dir, extra_context, conv_path,
             new_session=new_session,
-            use_session=use_session,  # 使用传入的会话设置
+            use_session=use_session,
         )
 
         if ok and step_files_exist(step_dir, step_to_execute):
-            # Git commit + push BEFORE updating state, so if push fails
-            # the next poll cycle will retry rather than skip silently.
             generated = [step_dir / f for f in STEP_FILES[step_to_execute]]
             step_label = step_to_execute.capitalize()
 
-            # For Do step, stage code changes before committing docs
             if step_to_execute == "do":
                 changed = _find_changed_files(base_work_dir)
                 if changed:
@@ -2459,13 +2210,12 @@ def process_issue(
             commit_msg = f"docs: PDCA {step_label} for #{number} — {title}"
             push_ok = git_commit_and_push(generated, commit_msg, base_work_dir)
 
-            # Update context hash so future polls won't re-execute the
-            # same step unless the issue/comments actually change.
             current_hash = context_hash(issue, comments)
             state[f"{step_to_execute}_context_hash"] = current_hash
 
             prev_step = state.get("current_step")
             state["current_step"] = step_to_execute
+            completed = state.get("completed_steps", [])
             if step_to_execute not in completed:
                 completed.append(step_to_execute)
             state["completed_steps"] = completed
@@ -2473,32 +2223,20 @@ def process_issue(
             state["last_check"] = datetime.now(timezone.utc).isoformat()
             state["step_completed_at"] = datetime.now(timezone.utc).isoformat()
             if not push_ok:
-                # Push failed — set flag so next poll cycle retries the push
-                # rather than silently skipping it.
                 state["push_pending"] = True
                 log.warning("Issue #%d: push pending — will retry on next poll cycle", number)
             else:
                 state.pop("push_pending", None)
             save_state(state_dir, number, state)
 
-            # Record state transition for metrics
             if _mt:
                 _mt.record_state_transition(
-                    number,
-                    from_state=prev_step or "idle",
-                    to_state=step_to_execute,
+                    number, from_state=prev_step or "idle", to_state=step_to_execute,
                 )
 
-            # Determine which output files actually exist — only generate
-            # hyperlinks for files that were just created, not stale files
-            # from a previous execution.
             existing = [f for f in STEP_FILES[step_to_execute] if (step_dir / f).is_file()]
             files = ", ".join(existing) if existing else ", ".join(STEP_FILES[step_to_execute])
 
-            # Build version lineage: branch name + GitHub permalink per output file.
-            # Derive the path relative to the git repo root — base_work_dir may
-            # be a subdirectory of the repo (e.g. "ai-crm/docs/..." not "docs/...").
-            # Include the commit hash for a stable version reference.
             pdca_branch = state.get("pdca_branch") or f"pdca/{number}-{slug}"
             version_links = ""
             try:
@@ -2515,7 +2253,6 @@ def process_issue(
                         f"{step_rel}/{f})"
                         for f in existing
                     ]
-                    # Also get the commit short hash for version tracking
                     commit_result = subprocess.run(
                         ["git", "rev-parse", "--short", "HEAD"],
                         cwd=str(base_work_dir), capture_output=True, text=True,
@@ -2529,8 +2266,6 @@ def process_issue(
                             f"{' · '.join(file_links)}"
                         )
                     else:
-                        # Push failed — still show hyperlinks to the branch
-                        # (which may exist locally) and mention the failure.
                         version_links = (
                             f"\nBranch: `{pdca_branch}` (local only — push failed){commit_info} | "
                             f"{' · '.join(file_links)}"
@@ -2538,17 +2273,10 @@ def process_issue(
             except Exception:
                 pass
 
-            # Fallback: if no version_links were generated (e.g. no git repo),
-            # still show the branch name with appropriate status.
             if not version_links:
-                if push_ok:
-                    pass  # no links to show, branch info already implied
-                else:
-                    version_links = (
-                        f"\nBranch: `{pdca_branch}` (local only — push failed)"
-                    )
+                if not push_ok:
+                    version_links = f"\nBranch: `{pdca_branch}` (local only — push failed)"
 
-            # For Plan step, add hint about outstanding questions
             plan_hint = ""
             if step_to_execute == "plan":
                 plan_hint = (
@@ -2557,21 +2285,14 @@ def process_issue(
                 )
 
             _gh.add_comment(
-                owner,
-                repo,
-                number,
+                owner, repo, number,
                 f"✅ **{step_to_execute.capitalize()}** completed. "
                 f"Generated: {files}\n"
                 f"See `docs/{number}-{slug}/{step_to_execute}/`"
-                f"{version_links}"
-                f"{plan_hint}",
+                f"{version_links}{plan_hint}",
             )
             log.info("Issue #%d: step '%s' done", number, step_to_execute)
 
-            # After Check step succeeds, require explicit user approval
-            # (#check-approved) before advancing.  This gates the transition
-            # to the Act step and prevents the runner from skipping ahead
-            # without user confirmation.
             if step_to_execute == "check":
                 state["phase"] = "check-review"
                 state["last_check"] = datetime.now(timezone.utc).isoformat()
@@ -2584,26 +2305,19 @@ def process_issue(
                 )
                 log.info("Issue #%d: Check done, awaiting #check-approved", number)
         else:
-            # run_skill failed OR required files were not generated.
-            # Distinguish the two cases for a clearer error message.
             if not ok:
                 reason = "AI execution failed"
             else:
                 missing = [f for f in STEP_FILES[step_to_execute] if not (step_dir / f).is_file()]
                 reason = f"files not generated: {', '.join(missing)}"
             _gh.add_comment(
-                owner,
-                repo,
-                number,
+                owner, repo, number,
                 f"❌ **{step_to_execute.capitalize()}** step failed ({reason}). "
                 f"Fix the issue then add a pdca-refresh tag to retry.",
             )
             log.error("Issue #%d: step '%s' failed — %s", number, step_to_execute, reason)
     else:
-        # Manual mode — notify user once
         if state.get("current_step") != step_to_execute or refresh:
-            # Create the PDCA feature branch even in manual mode so the
-            # user has a branch to work on once files are generated.
             branch = ensure_pdca_branch(state, state_dir, number, title, base_work_dir)
             if not branch:
                 log.error("Issue #%d: cannot proceed without PDCA branch", number)
@@ -2615,10 +2329,6 @@ def process_issue(
 
             slug = slugify(title)
             files = ", ".join(STEP_FILES[step_to_execute])
-
-            # In manual mode files haven't been generated yet, so we show
-            # the branch link (which exists on GitHub) and the expected
-            # file paths — but no dead links to non-existent files.
             branch_url = f"https://github.com/{owner}/{repo}/tree/{branch}"
             output_dir = f"docs/{number}-{slug}/{step_to_execute}/"
 
@@ -2630,13 +2340,10 @@ def process_issue(
                 )
 
             _gh.add_comment(
-                owner,
-                repo,
-                number,
+                owner, repo, number,
                 f"🔄 **{step_to_execute.capitalize()}** step ready.\n"
                 f"Run the `{SKILL_NAMES[step_to_execute]}` skill to generate: {files}\n"
-                f"Branch: [`{branch}`]({branch_url}) → `{output_dir}`"
-                f"{plan_hint}",
+                f"Branch: [`{branch}`]({branch_url}) → `{output_dir}`{plan_hint}",
             )
             state["current_step"] = step_to_execute
             state["last_check"] = datetime.now(timezone.utc).isoformat()

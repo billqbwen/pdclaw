@@ -460,12 +460,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._json({"error": "bad issue number"}, 400)
 
         elif path == "/api/log":
+            body = "\n".join(self.log_lines).encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.send_header("Content-Length", "0")
+            self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            # For SSE-like streaming, we just return latest lines
-            # A more advanced impl would use EventSource
+            self.wfile.write(body)
 
         elif path == "/api/metrics":
             self._json(self.get_snapshot())
