@@ -93,38 +93,24 @@ Issue #pdca-start
 
 ### State Machine
 
+```mermaid
+stateDiagram-v2
+    [*] --> idle
+    idle --> plan: #pdca-start
+    plan --> do: #plan-approved
+    plan --> plan: #pdca-refresh
+    do --> check: #do-approved
+    check --> decision: #check-approved
+    check --> check: #pdca-refresh
+    decision --> deploy: #Deploy
+    decision --> fix: #Fix
+    decision --> fallback: #Fallback
+    fix --> do
+    deploy --> [*]
+    fallback --> [*]
 ```
-  ┌──────────────────────────────────────────────────────────────┐
-  │                                                              │
-  ▼                                                              │
- [idle] ──#pdca-start──▶ [plan] ──#plan-approved──▶ [do]        │
-   ▲                         │                        │          │
-   │                         │ #pdca-refresh          │ #do-approved
-   │                         ▼                        ▼          │
-   │ #pdca-abort          [plan] (re-run)          [check]       │
-   │ #pdca-reset             │                        │          │
-   │                         │              #check-approved      │
-   │                         │              #pdca-refresh         │
-   │                         │                        ▼          │
-   │                         │                  [check] (re-run) │
-   │                         │                        │          │
-   │                         │         Check success → decision  │
-   │                         │              │         │          │
-   │                         │     #Deploy  #Fix   #Fallback     │
-   │                         │         │       │        │        │
-   │                         │         ▼       │        │        │
-   │                         │    [deploy]     │        ▼        │
-   │                         │         │       │   [revert]      │
-   │                         │         ▼       ▼        │        │
-   │                         └──── [done] ◀── [do] ◀────┘        │
-   │                                     │                       │
-   └─────────────────────────────────────┘                       │
-                              #pdca-close                        │
 
-  Note: In normal flow, the Act step is replaced by the Decision
-  Phase (#Deploy / #Fix / #Fallback). The pdca-act skill file
-  still exists for manual execution but is rarely used.
-```
+Lifecycle: `#pdca-abort` / `#pdca-reset` (any state → idle); `#pdca-close` / `#pdca-skip` (any state → done). In normal flow, the Act step is replaced by the Decision phase. The `pdca-act` skill file exists for manual use but is rarely needed.
 
 ---
 

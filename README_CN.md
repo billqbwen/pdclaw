@@ -94,38 +94,24 @@ Issue #pdca-start
 
 ### 状态机
 
+```mermaid
+stateDiagram-v2
+    [*] --> idle
+    idle --> plan: #pdca-start
+    plan --> do: #plan-approved
+    plan --> plan: #pdca-refresh
+    do --> check: #do-approved
+    check --> decision: #check-approved
+    check --> check: #pdca-refresh
+    decision --> deploy: #Deploy
+    decision --> fix: #Fix
+    decision --> fallback: #Fallback
+    fix --> do
+    deploy --> [*]
+    fallback --> [*]
 ```
-  ┌──────────────────────────────────────────────────────────────┐
-  │                                                              │
-  ▼                                                              │
- [idle] ──#pdca-start──▶ [plan] ──#plan-approved──▶ [do]        │
-   ▲                         │                        │          │
-   │                         │ #pdca-refresh          │ #do-approved
-   │                         ▼                        ▼          │
-   │ #pdca-abort          [plan] (重新执行)        [check]       │
-   │ #pdca-reset             │                        │          │
-   │                         │              #check-approved      │
-   │                         │              #pdca-refresh         │
-   │                         │                        ▼          │
-   │                         │               [check] (重新执行)   │
-   │                         │                        │          │
-   │                         │         Check 成功 → 决策阶段      │
-   │                         │              │         │          │
-   │                         │     #Deploy  #Fix   #Fallback     │
-   │                         │         │       │        │        │
-   │                         │         ▼       │        │        │
-   │                         │    [deploy]     │        ▼        │
-   │                         │         │       │   [revert]      │
-   │                         │         ▼       ▼        │        │
-   │                         └──── [done] ◀── [do] ◀────┘        │
-   │                                     │                       │
-   └─────────────────────────────────────┘                       │
-                              #pdca-close                        │
 
-  注意：在正常流程中，Act 步骤被决策阶段
-  (#Deploy / #Fix / #Fallback) 替代。pdca-act 技能文件
-  仍然保留可用于手动执行，但实际使用中较为少见。
-```
+生命周期：`#pdca-abort` / `#pdca-reset`（任何状态 → idle）；`#pdca-close` / `#pdca-skip`（任何状态 → 完成）。正常流程中 Act 步骤由决策阶段替代，`pdca-act` 技能文件保留供手动使用。
 
 ---
 
