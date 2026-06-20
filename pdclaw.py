@@ -800,6 +800,7 @@ def run_skill(
     skill_name: str,
     issue: dict,
     work_dir: Path,
+    state_dir: Path | None = None,
     extra_context: str = "",
     conv_path: Path | None = None,
     new_session: bool = False,
@@ -822,7 +823,7 @@ def run_skill(
 
     # 如果强制新会话，重置会话
     if new_session and use_session:
-        reset_session(issue_number, work_dir)
+        reset_session(issue_number, work_dir, state_dir)
         log.info("[AI] Session reset for issue #%d (new_session=True, work_dir=%s)", issue_number, work_dir)
 
     skill_content = _read_skill(skill_name)
@@ -857,7 +858,7 @@ def run_skill(
     # ── 使用 Session 模式执行 ──────────────────────────────────────────
     if use_session:
         try:
-            session = get_session(issue_number, work_dir, CLAUDE_MODEL, CLAUDE_BASE_URL)
+            session = get_session(issue_number, work_dir, state_dir, CLAUDE_MODEL, CLAUDE_BASE_URL)
             log.info("[AI] Session mode — model=%s, base_url=%s, step=%s, timeout=%ds, history_turns=%d",
                      session.model, session.base_url, step_name, timeout, len(session.history))
             t0 = time.time()
@@ -1262,7 +1263,7 @@ def _handle_lifecycle_tags(
                 log.info("Issue #%d: memory cleared via #pdca-reset", number)
 
         # Clear Claude session for this issue
-        reset_session(number, base_work_dir)
+        reset_session(number, base_work_dir, state_dir)
         log.info("Issue #%d: Claude session cleared via #pdca-reset", number)
 
         # Reset state in-place and save — do NOT delete the state file
@@ -1283,7 +1284,7 @@ def _handle_lifecycle_tags(
 
     if "#pdca-new-session" in tags:
         # 仅重置 Claude 会话，不清除状态和记忆
-        reset_session(number, base_work_dir)
+        reset_session(number, base_work_dir, state_dir)
         state["new_session"] = True  # 标记下次执行使用新会话
         save_state(state_dir, number, state)
         _gh.add_comment(
@@ -1694,7 +1695,7 @@ def _handle_decision_tag(
         state["current_step"] = None
         state["phase"] = None
         state["last_check"] = datetime.now(timezone.utc).isoformat()
-        reset_session(number, base_work_dir)
+        reset_session(number, base_work_dir, state_dir)
         save_state(state_dir, number, state)
         _gh.add_comment(
             owner, repo, number,
@@ -1913,7 +1914,7 @@ def process_issue(
     is_new_issue = state.get("status") is None and not state.get("completed_steps")
     if is_new_issue:
         log.info("Issue #%d: new issue detected, ensuring fresh session", number)
-        reset_session(number, base_work_dir)
+        reset_session(number, base_work_dir, state_dir)
 
     # Retry pending push from a previous cycle (e.g. transient network failure)
     if state.get("push_pending"):
@@ -1923,17 +1924,64 @@ def process_issue(
 
         # For deploy push retry, we may need to switch to the target branch first
         # since the merge was already committed locally on the target branch.
+        # If the working tree is dirty (uncommitted changes from other issues),
+        # stash before checkout and pop after push, mirroring the deploy handler.
         push_pending_type = state.get("push_pending_type", "step")
+        _retry_stashed = False
+        _retry_original_branch = None
         if push_pending_type == "deploy":
             target = DEPLOY_BRANCH
             log.info("Issue #%d: deploy push retry — ensuring we're on branch '%s'", number, target)
             try:
-                subprocess.run(
-                    ["git", "checkout", target],
-                    cwd=str(base_work_dir), capture_output=True, timeout=30,
+                # Remember the current branch so we can return to it
+                rev = subprocess.run(
+                    ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                    cwd=str(base_work_dir), capture_output=True, text=True, timeout=10,
                 )
-            except Exception:
-                log.warning("Issue #%d: could not checkout '%s' for deploy push retry", number, target)
+                _retry_original_branch = rev.stdout.strip() if rev.returncode == 0 else None
+
+                # Stash dirty changes if any (same as deploy handler)
+                status = subprocess.run(
+                    ["git", "status", "--porcelain"],
+                    cwd=str(base_work_dir), capture_output=True, text=True, timeout=10,
+                )
+                if status.stdout.strip():
+                    subprocess.run(
+                        ["git", "stash", "push", "--include-untracked", "-m", "pdca-push-retry-stash"],
+                        cwd=str(base_work_dir), capture_output=True, timeout=30,
+                    )
+                    _retry_stashed = True
+
+                checkout = subprocess.run(
+                    ["git", "checkout", target],
+                    cwd=str(base_work_dir), capture_output=True, text=True, timeout=30,
+                )
+                if checkout.returncode != 0:
+                    log.warning("Issue #%d: checkout to '%s' failed: %s", number, target, checkout.stderr.strip()[:200])
+                    # Can't push — restore and bail
+                    if _retry_stashed:
+                        subprocess.run(
+                            ["git", "stash", "pop"],
+                            cwd=str(base_work_dir), capture_output=True, timeout=30,
+                        )
+                    _gh.add_comment(
+                        owner, repo, number,
+                        f"**Deploy Push Retry Failed** — could not switch to `{target}` branch "
+                        f"(working directory may be dirty). Will retry on next poll cycle.",
+                    )
+                    state["last_check"] = datetime.now(timezone.utc).isoformat()
+                    save_state(state_dir, number, state)
+                    return
+            except Exception as e:
+                log.warning("Issue #%d: could not checkout '%s' for deploy push retry: %s", number, target, e)
+                _gh.add_comment(
+                    owner, repo, number,
+                    f"**Deploy Push Retry Failed** — error switching to `{target}` branch: {e}. "
+                    f"Will retry on next poll cycle.",
+                )
+                state["last_check"] = datetime.now(timezone.utc).isoformat()
+                save_state(state_dir, number, state)
+                return
 
         for attempt in range(1, 4):
             try:
@@ -1982,6 +2030,22 @@ def process_issue(
                 push_retry_ok = False
                 log.warning("Issue #%d: pending push verification failed — will retry next cycle", number)
 
+        # Restore original branch and stashed changes after deploy push retry
+        if push_pending_type == "deploy":
+            try:
+                if _retry_original_branch:
+                    subprocess.run(
+                        ["git", "checkout", _retry_original_branch],
+                        cwd=str(base_work_dir), capture_output=True, timeout=30,
+                    )
+                if _retry_stashed:
+                    subprocess.run(
+                        ["git", "stash", "pop"],
+                        cwd=str(base_work_dir), capture_output=True, timeout=30,
+                    )
+            except Exception:
+                pass
+
         if push_retry_ok:
             log.info("Issue #%d: pending push succeeded", number)
             # If this was a deploy retry, also mark act as completed now
@@ -1997,7 +2061,18 @@ def process_issue(
             state.pop("push_pending_type", None)
             save_state(state_dir, number, state)
         else:
-            # Still failing — wait for next cycle to retry
+            # Still failing — wait for next cycle to retry.
+            # Post a comment so the user knows about the push issue.
+            target_branch = state.get("push_pending_type", "step")
+            if target_branch == "deploy":
+                target_branch = DEPLOY_BRANCH
+            _gh.add_comment(
+                owner, repo, number,
+                f"**Deploy Push Retry Failed**\n\n"
+                f"Git push to `{target_branch}` failed after 3 attempts — network connectivity issue "
+                f"(unable to reach GitHub). The merge is committed locally. "
+                f"Will retry push on the next poll cycle.",
+            )
             state["last_check"] = datetime.now(timezone.utc).isoformat()
             save_state(state_dir, number, state)
             return
@@ -2349,7 +2424,7 @@ def process_issue(
 
         # 使用会话模式执行（同一 Issue 的步骤间保持上下文）
         ok, _ = run_skill(
-            skill, issue, skill_cwd, extra_context, conv_path,
+            skill, issue, skill_cwd, state_dir, extra_context, conv_path,
             new_session=new_session,
             use_session=use_session,  # 使用传入的会话设置
         )
@@ -2703,20 +2778,26 @@ def main() -> None:
     if not _gh.check_auth():
         log.warning("GitHub API not authenticated. Set GITHUB_TOKEN env var.")
 
-    state_dir = Path(args.state_dir)
+    work_dir = Path(args.work_dir).resolve()
+
+    # Resolve state/memory/metrics directories relative to work_dir by default.
+    # If a path is already absolute it stays as-is; relative paths are resolved
+    # under work_dir so everything lives inside the managed repository.
+    _resolve_under_work = lambda p: Path(p) if Path(p).is_absolute() else work_dir / p
+    state_dir = _resolve_under_work(args.state_dir)
     state_dir.mkdir(parents=True, exist_ok=True)
 
     # Initialize memory system
     global _memory
     if not args.no_memory:
-        _memory = PDCAMemory(Path(args.memory_dir))
-        log.info("Memory system initialized at %s", args.memory_dir)
+        memory_dir = _resolve_under_work(args.memory_dir)
+        _memory = PDCAMemory(memory_dir)
+        log.info("Memory system initialized at %s", memory_dir)
     else:
         log.info("Memory system disabled")
-    work_dir = Path(args.work_dir).resolve()
 
     # Initialize metrics collector
-    metrics_dir = Path(args.metrics_dir)
+    metrics_dir = _resolve_under_work(args.metrics_dir)
     _metrics_collector = init_metrics(metrics_dir)
     log.info("Metrics collector initialized at %s", metrics_dir)
 
@@ -2734,9 +2815,11 @@ def main() -> None:
     use_session = args.use_session and not args.no_session
     log.info(
         "PDClaw started (interval=%ds, auto_run=%s, work_dir=%s, "
+        "state_dir=%s, memory_dir=%s, metrics_dir=%s, "
         "deploy_branch=%s, model=%s, use_session=%s, dashboard=%s)",
         args.interval, args.auto_run, work_dir,
-        DEPLOY_BRANCH, CLAUDE_MODEL, use_session,
+        state_dir, memory_dir if not args.no_memory else "disabled",
+        metrics_dir, DEPLOY_BRANCH, CLAUDE_MODEL, use_session,
         f"http://localhost:{args.dashboard_port}" if _dashboard else "off",
     )
 

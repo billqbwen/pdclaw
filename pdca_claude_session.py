@@ -24,6 +24,7 @@ class ClaudeSession:
         self,
         issue_number: int,
         work_dir: Path,
+        state_dir: Optional[Path] = None,
         model: Optional[str] = None,
         base_url: Optional[str] = None,
     ):
@@ -32,8 +33,11 @@ class ClaudeSession:
         self.model = model or "deepseek-v4-flash"
         self.base_url = base_url or "https://api.deepseek.com/anthropic"
 
-        # 会话存储路径: .pdca_state/{issue_number}/claude_session.json
-        self.session_file = self.work_dir / ".pdca_state" / str(issue_number) / "claude_session.json"
+        # 会话存储路径: 优先使用 state_dir，回退到 work_dir/.pdca_state/
+        if state_dir:
+            self.session_file = state_dir / str(issue_number) / "claude_session.json"
+        else:
+            self.session_file = self.work_dir / ".pdca_state" / str(issue_number) / "claude_session.json"
         self.session_file.parent.mkdir(parents=True, exist_ok=True)
 
         # 会话历史 - 每个步骤的上下文
@@ -204,6 +208,7 @@ _sessions: dict[int, ClaudeSession] = {}
 
 
 def get_session(issue_number: int, work_dir: Path,
+                state_dir: Optional[Path] = None,
                 model: Optional[str] = None,
                 base_url: Optional[str] = None) -> ClaudeSession:
     """获取或创建 issue 对应的会话
@@ -214,19 +219,21 @@ def get_session(issue_number: int, work_dir: Path,
         _sessions[issue_number] = ClaudeSession(
             issue_number=issue_number,
             work_dir=work_dir,
+            state_dir=state_dir,
             model=model,
             base_url=base_url,
         )
     return _sessions[issue_number]
 
 
-def reset_session(issue_number: int, work_dir: Path | None = None):
+def reset_session(issue_number: int, work_dir: Path | None = None, state_dir: Path | None = None):
     """重置指定 issue 的会话
 
     Args:
         issue_number: Issue 编号
         work_dir: 工作目录，用于定位 session 文件。如果不提供，会尝试从
                   已缓存的 session 中获取 work_dir，最后回退到相对路径。
+        state_dir: PDCA state 目录，优先用于定位 session 文件。
     """
     # 先从缓存中获取 session 以确定正确的 work_dir
     cached = _sessions.get(issue_number)
@@ -236,10 +243,14 @@ def reset_session(issue_number: int, work_dir: Path | None = None):
 
     # 清理磁盘上的 session 文件
     # session 文件可能存储在不同的位置（取决于 step 的 skill_cwd）：
+    # - 优先：state_dir/{n}/claude_session.json（统一管理）
     # - Plan/Check/Act: step_dir/.pdca_state/{n}/claude_session.json
     # - Do: base_work_dir/.pdca_state/{n}/claude_session.json
-    # 因此需要尝试多个可能的路径
     candidates: list[Path] = []
+
+    # 优先使用 state_dir（统一管理路径）
+    if state_dir:
+        candidates.append(state_dir / str(issue_number) / "claude_session.json")
 
     if work_dir:
         candidates.append(work_dir / ".pdca_state" / str(issue_number) / "claude_session.json")

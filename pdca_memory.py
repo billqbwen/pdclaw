@@ -72,6 +72,7 @@ class PDCAMemory:
         """Persist global memory to disk."""
         if self._global_cache is not None:
             self._global_cache["updated_at"] = datetime.now(timezone.utc).isoformat()
+            self.global_memory_path.parent.mkdir(parents=True, exist_ok=True)
             self.global_memory_path.write_text(
                 json.dumps(self._global_cache, indent=2, sort_keys=True)
             )
@@ -158,7 +159,9 @@ class PDCAMemory:
     def _save_issue(self, issue_number: int, data: dict) -> None:
         """Persist issue memory."""
         data["updated_at"] = datetime.now(timezone.utc).isoformat()
-        self._issue_path(issue_number).write_text(
+        path = self._issue_path(issue_number)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
             json.dumps(data, indent=2, sort_keys=True)
         )
 
@@ -245,6 +248,7 @@ class PDCAMemory:
         step_dir.mkdir(parents=True, exist_ok=True)
 
         path = step_dir / f"{artifact_type}.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content)
         return path
 
